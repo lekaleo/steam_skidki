@@ -147,14 +147,22 @@ class Storage:
         ).fetchall()
         return [self._row_to_game(r) for r in rows]
 
-    def candidates(self, min_discount: int, min_score: int = 0) -> list[Game]:
-        """Неопубликованные кандидаты: сначала качественные и популярные, потом всё остальное."""
+    def candidates(self, min_discount: int, min_score: int = 0,
+                   max_age_hours: int = 48) -> list[Game]:
+        """Неопубликованные кандидаты: сначала качественные и популярные, потом всё остальное.
+
+        max_age_hours: берём только игры, виденные в Steam за последние N часов.
+        Скидки кончаются и цены меняются — игра, пропавшая из выдачи Steam,
+        не должна поститься со старой ценой.
+        """
+        cutoff = int(time.time()) - int(max_age_hours) * 3600
         rows = self.conn.execute(
             """SELECT s.* FROM seen s
                LEFT JOIN posted p ON p.appid=s.appid
                WHERE s.discount>=? AND p.appid IS NULL AND COALESCE(s.score,0)>=?
+                 AND s.last_seen>=?
                ORDER BY COALESCE(s.score,0) DESC, s.discount DESC, s.last_seen DESC""",
-            (min_discount, int(min_score or 0)),
+            (min_discount, int(min_score or 0), cutoff),
         ).fetchall()
         return [self._row_to_game(r) for r in rows]
 
