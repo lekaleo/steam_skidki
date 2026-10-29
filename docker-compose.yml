@@ -1,0 +1,14 @@
+services:
+  steam-bot:
+    build: .
+    container_name: steam_skidki_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Europe/Moscow
+    volumes:
+      # база скидок и статистика сохраняются между перезапусками
+      - ./data:/app/data
+      - ./images:/app/images
+      - ./assets:/app/assets

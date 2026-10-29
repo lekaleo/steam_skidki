@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.env
+data/
+images/
+assets/fonts/*.ttf
+*.md
+!README.md
+_*.py
