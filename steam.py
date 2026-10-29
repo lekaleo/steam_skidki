@@ -84,13 +84,15 @@ def search_specials(max_pages: int | None = None, min_discount: int | None = Non
         if not html or not html.strip():
             break
         pieces = re.split(r'data-ds-appid="(\d+)"', html)
-        found = 0
+        rows = 0    # всего игр на странице (до фильтра скидки)
+        found = 0   # прошло фильтр min_discount
         for i in range(1, len(pieces) - 1, 2):
             appid = int(pieces[i])
             chunk = pieces[i + 1]
             title_m = _TITLE_RE.search(chunk)
             if not title_m:
                 continue
+            rows += 1
             title = _strip_tags(title_m.group(1))
             disc_m = _DISC_RE.search(chunk)
             discount = int(disc_m.group(1)) if disc_m else 0
@@ -111,7 +113,9 @@ def search_specials(max_pages: int | None = None, min_discount: int | None = Non
             )
             found += 1
         page += 1
-        if found < 100:
+        # «последняя страница» определяем по сырому числу строк, а не по found:
+        # фильтр скидки режет часть игр, и раньше это обрывало обход уже на 1-й странице
+        if rows < 100:
             break
         time.sleep(cfg.steam_delay)
     return list(games.values())
