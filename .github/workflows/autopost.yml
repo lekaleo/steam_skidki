@@ -1,0 +1,89 @@
+name: autopost
+
+# Полностью бесплатный serverless-запуск: GitHub Actions по расписанию.
+# ПК выключен — посты всё равно публикуются.
+#
+# Что кэшируется между запусками (иначе бот теряет память и качает шрифты заново):
+#   data/state.db     — база скидок, «что уже постили», эмодзи-слоты, страйки
+#   data/rates.json   — курсы валют ЦБ (суточный кэш)
+#   assets/fonts/     — Montserrat / Noto Sans для карточек
+
+on:
+  schedule:
+    # каждые 3 часа (UTC). Слоты расписания задаются в MSK внутри .env/секретов.
+    - cron: "0 */3 * * *"
+  workflow_dispatch: {}   # кнопка "Run workflow" для ручного запуска
+
+permissions:
+  contents: read
+
+concurrency:
+  group: steam-autopost
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 1) база состояния: что постили, эмодзи-слоты, страйки модератора
+      - name: Restore state.db
+        uses: actions/cache@v4
+        with:
+          path: data/state.db
+          key: steamdb-state-${{ github.run_id }}
+          restore-keys: |
+            steamdb-state-
+
+      # 2) курсы валют (обновляются раз в сутки внутри бота)
+      - name: Restore currency rates
+        uses: actions/cache@v4
+        with:
+          path: data/rates.json
+          key: steamdb-rates-${{ github.run_id }}
+          restore-keys: |
+            steamdb-rates-
+
+      # 3) шрифты карточек — качаются один раз, дальше берутся из кэша
+      - name: Restore fonts
+        uses: actions/cache@v4
+        with:
+          path: assets/fonts
+          key: steamdb-fonts-v1
+          restore-keys: |
+            steamdb-fonts-
+
+      - name: Install deps
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Selfcheck (только ручной запуск)
+        if: github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL: ${{ secrets.CHANNEL }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+        run: python run_bot.py --selfcheck
+
+      - name: Publish one post (если сейчас есть слот)
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL: ${{ secrets.CHANNEL }}
+          CHANNEL_TITLE: ${{ secrets.CHANNEL_TITLE }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          SCHEDULE: ${{ vars.SCHEDULE }}
+          MIN_DISCOUNT: "15"
+          MIN_SCORE: "0"
+          MAX_SEARCH_PAGES: "40"
+          SYNC_HOURS: "6"
+          TIMEZONE_OFFSET: "3"
+          PREMIUM_EMOJI: "1"
+        run: python run_bot.py --once
