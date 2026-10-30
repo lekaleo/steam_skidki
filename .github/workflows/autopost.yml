@@ -14,10 +14,8 @@ name: autopost
 
 on:
   schedule:
-    # страховка на случай обрыва цепочки
-    - cron: "0 */3 * * *"
-    # слоты публикаций (09/12/15/18 UTC = 12/15/18/21 МСК)
-    - cron: "0 9,12,15,18 * * *"
+    # страховка на случай обрыва цепочки (каждые 20 минут)
+    - cron: "*/20 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -85,6 +83,17 @@ jobs:
           restore-keys: |
             steamdb-fonts-
 
+      # Резервная копия базы через actions/cache: восстанавливаем, только если
+      # в репозитории data/state.db отсутствует (основной способ — авто-коммит).
+      - name: Restore state.db backup (если нет в репозитории)
+        if: ${{ !hashFiles('data/state.db') }}
+        uses: actions/cache@v4
+        with:
+          path: data/state.db
+          key: steamdb-state-${{ github.run_id }}
+          restore-keys: |
+            steamdb-state-
+
       - name: Install deps
         run: pip install -r requirements.txt
 
@@ -111,6 +120,13 @@ jobs:
         run: timeout --signal=INT 200 python run_bot.py --serve 120 || true
 
       # ---------- сохранить историю ----------
+      - name: Save state.db to actions/cache (резерв)
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: data/state.db
+          key: steamdb-state-${{ github.run_id }}
+
       - name: Persist state.db in repository
         if: always()
         run: |

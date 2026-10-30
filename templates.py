@@ -233,48 +233,60 @@ _SENT_END_RE = re.compile(r"[.!?…]+(?=\s|$)")
 _BAD_DESC = ("все права защищены", "©", "all rights reserved", "steam", "valve")
 
 
-def description(details: dict) -> str:
-    """Русское описание игры: 1–2 ПОЛНЫХ предложения, не длиннее 200 символов.
+def _desc_fallback(details: dict) -> str:
+    """Резервное описание, если Steam не дал текст: собираем из жанров и названия."""
+    name = (details.get("name") or "").strip()
+    genres = [g for g in (details.get("genres") or []) if g]
+    if not name or not genres:
+        return ""
+    g = " / ".join(genres[:2])
+    return (f"«{name}» — {g}. Проект сейчас со скидкой в Steam: "
+            "удачный момент, чтобы познакомиться с ним или вернуться снова.")
 
-    Текст уже переведён на русский в steam.fetch_game_details (translate_ru),
-    поэтому английский тут только как аварийный случай — тогда лучше пусто.
+
+def description(details: dict) -> str:
+    """Русское описание игры: 1–2 ПОЛНЫХ предложения, 120–200 символов.
+
+    Текст уже переведён на русский в steam.fetch_game_details (translate_ru).
+    Если короткого описания нет — собираем описание из жанров и названия;
+    блок описания в single обязателен.
     """
+    out = ""
     text = _clean(details.get("short_desc_raw") or "")
     if len(text) < 25:
         text = _clean(details.get("short_desc") or "")
-    if len(text) < 25:
-        return ""
-    if _latin_ratio(text) > 0.5:
-        return ""
+    if len(text) >= 25 and _latin_ratio(text) <= 0.5:
+        parts: list[str] = []
+        total = 0
+        pos = 0
+        for m in _SENT_END_RE.finditer(text):
+            sent = text[pos:m.end()].strip()
+            pos = m.end()
+            if not sent:
+                continue
+            if total + len(sent) + (1 if parts else 0) > MAX_DESC:
+                break
+            parts.append(sent)
+            total += len(sent) + 1
+            if len(parts) >= 2:
+                break
 
-    parts: list[str] = []
-    total = 0
-    pos = 0
-    for m in _SENT_END_RE.finditer(text):
-        sent = text[pos:m.end()].strip()
-        pos = m.end()
-        if not sent:
-            continue
-        if total + len(sent) + (1 if parts else 0) > MAX_DESC:
-            break
-        parts.append(sent)
-        total += len(sent) + 1
-        if len(parts) >= 2:
-            break
+        if not parts:
+            # одно длинное предложение > 200 — берём сжатый вариант
+            short = _clean(details.get("short_desc") or "")
+            if 25 <= len(short) <= MAX_DESC and _latin_ratio(short) <= 0.5:
+                parts = [short]
 
-    if not parts:
-        # одно длинное предложение > 200 — берём сжатый вариант
-        short = _clean(details.get("short_desc") or "")
-        if 25 <= len(short) <= MAX_DESC and _latin_ratio(short) <= 0.5:
-            parts = [short]
+        out = " ".join(parts).strip()
+        low = out.lower()
+        if any(b in low for b in _BAD_DESC):
+            out = ""
 
-    out = " ".join(parts).strip()
-    if len(out) < 20:
-        return ""
-    low = out.lower()
-    if any(b in low for b in _BAD_DESC):
-        return ""
-    return _e(out)
+    if len(out) < 120:
+        fb = _desc_fallback(details)
+        if fb:
+            return _e(fb)
+    return _e(out) if out else ""
 
 
 def one_sentence(details: dict) -> str:

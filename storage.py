@@ -168,7 +168,8 @@ class Storage:
                LEFT JOIN posted p ON p.appid=s.appid
                WHERE s.discount>=? AND p.appid IS NULL AND COALESCE(s.score,0)>=?
                  AND s.last_seen>=?
-               ORDER BY COALESCE(s.score,0) DESC, s.discount DESC, s.last_seen DESC""",
+               ORDER BY COALESCE(s.score,0) DESC, s.discount DESC, s.last_seen DESC
+               LIMIT 50""",
             (min_discount, int(min_score or 0), cutoff),
         ).fetchall()
         return [self._row_to_game(r) for r in rows]

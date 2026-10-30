@@ -11,6 +11,7 @@ import os
 import random
 import re
 import shutil
+import threading
 import time
 from datetime import datetime
 
@@ -31,6 +32,7 @@ log = logging.getLogger("poster")
 
 API = "https://api.telegram.org/bot{token}/{method}"
 TG_EMOJI_RE = re.compile(r"</?tg-emoji[^>]*>", re.I)
+TG_EMOJI_FULL_RE = re.compile(r"<tg-emoji[^>]*>(.*?)</tg-emoji>", re.I | re.S)
 BLOCKQUOTE_RE = re.compile(r"</?blockquote[^>]*>", re.I)
 CODE_RE = re.compile(r"</?code>", re.I)
 ALL_TAGS_RE = re.compile(r"</?(?:b|strong|i|em|u|ins|s|strike|del|a|span|pre)[^>]*>", re.I)
@@ -39,7 +41,6 @@ SKIP_TYPES = {"demo", "music", "video", "series", "mod", "advertising", "hardwar
 
 _syncing = False
 _freebie_lock = False
-
 
 def _mask(text) -> str:
     return cfg.mask(text)
@@ -127,17 +128,28 @@ def _trim_caption(caption: str) -> str:
     return "\n".join(kept).rstrip()
 
 
+# Сериализация публикаций: планировщик и ручная команда никогда не возьмут
+# одну и ту же игру параллельно.
+POST_LOCK = threading.Lock()
+
+
+def _replace_tg_emoji(caption: str) -> str:
+    """Заменяет <tg-emoji ...>🔥</tg-emoji> на обычный 🔥 внутри тега."""
+    return TG_EMOJI_RE.sub("", TG_EMOJI_FULL_RE.sub(lambda m: m.group(1) or "", caption))
+
+
 def send_photo(caption: str, photo_path: str, reply_markup: dict | None = None) -> bool:
     if not cfg.bot_token:
         log.warning("Нет BOT_TOKEN, пост не отправлен")
         return False
     caption = _trim_caption(caption)
-    # каскад: полный HTML -> без tg-emoji -> без blockquote/code -> без тегов
+    # каскад: полный HTML -> обычные эмодзи вместо tg-emoji -> без blockquote -> текст
+    no_tg = _replace_tg_emoji(caption)
     variants = [
         ("полный", caption),
-        ("без tg-emoji", TG_EMOJI_RE.sub("", caption)),
-        ("без blockquote/code", ALL_TAGS_RE.sub("", BLOCKQUOTE_RE.sub("", CODE_RE.sub("", TG_EMOJI_RE.sub("", caption))))),
-        ("plain text", ALL_TAGS_RE.sub("", BLOCKQUOTE_RE.sub("", CODE_RE.sub("", TG_EMOJI_RE.sub("", caption))))),
+        ("эмодзи вместо tg-emoji", no_tg),
+        ("без blockquote/code", ALL_TAGS_RE.sub("", BLOCKQUOTE_RE.sub("", CODE_RE.sub("", no_tg)))),
+        ("plain text", ALL_TAGS_RE.sub("", BLOCKQUOTE_RE.sub("", CODE_RE.sub("", no_tg)))),
     ]
     last_err = ""
     for i, (name, text) in enumerate(variants):
@@ -422,7 +434,7 @@ def _post_games(games, ptype, caption, card_path, markup=None, mark=True) -> boo
 
 # ---------------- форматы ----------------
 
-def post_single() -> bool:
+def _post_single_impl() -> bool:
     """Одиночный пост: игра ОБЯЗАТЕЛЬНО с русским описанием в 1–2 предложения."""
     _ensure_candidates(6)
     st = _storage()
@@ -451,18 +463,18 @@ def post_single() -> bool:
     return False
 
 
-def post_multi() -> bool:
+def _post_multi_impl() -> bool:
     """Подборка РОВНО из 4 игр: мульти-карточка + список с ценами в 4 валютах."""
     _ensure_candidates(8)
     cands = _pick(_event_priority(_storage().candidates(cfg.min_discount, cfg.min_score)), 4)
     if len(cands) < 4:
         log.info("Меньше 4 кандидатов — публикуем одиночный пост")
-        return post_single()
+        return _post_single_impl()  # уже внутри POST_LOCK
     details = _enrich(cands)
     games = [g for g in cands if g.appid in details]
     if len(games) < 4:
         log.info("Не у всех игр есть детали (%d из 4) — одиночный пост", len(games))
-        return post_single()
+        return _post_single_impl()
     caption, used = templates.multi_post(games, details)
     games = games[:used]
     card = _multi_card(games, details, "multi")
@@ -473,7 +485,7 @@ def post_multi() -> bool:
                        markup=_keyboard(games, details, "group"))
 
 
-def post_news() -> bool:
+def _post_news_impl() -> bool:
     """Игровая новость дня: свежий RSS-материал + карточка «НОВОСТИ ИГР»."""
     st = _storage()
     article = news_mod.pick_article(st.is_news_posted)
@@ -489,7 +501,7 @@ def post_news() -> bool:
         log.warning("Карточка новости не собралась")
         return False
 
-    markup = {"inline_keyboard": [[{"text": "📰 Читать новость", "url": article["url"]}]]}
+    markup = {"inline_keyboard": [[{"text": "📖 Читать подробнее", "url": article["url"]}]]}
     if not send_photo(caption, out, reply_markup=markup):
         return False
 
@@ -502,6 +514,21 @@ def post_news() -> bool:
             except OSError:
                 pass
     return True
+
+
+def post_single() -> bool:
+    with POST_LOCK:
+        return _post_single_impl()
+
+
+def post_multi() -> bool:
+    with POST_LOCK:
+        return _post_multi_impl()
+
+
+def post_news() -> bool:
+    with POST_LOCK:
+        return _post_news_impl()
 
 
 def post_series() -> bool:
@@ -784,88 +811,148 @@ def post_releases() -> bool:
 # ---------------- самодиагностика ----------------
 
 def selfcheck() -> list[dict]:
-    """Проверка всех узлов автономности. [{"name", "ok", "detail"}]."""
+    """Проверка всех узлов автономности. [{"name", "ok", "detail"}].
+
+    Чек-лист: Telegram Bot API (имя, вебхук, админ в канале), SQLite WAL
+    (seen/posted/дубли), курсы валют (USD/KZT/UAH к RUB), тестовая сборка
+    всех 3 типов постов (multi, single с описанием, news с проверкой RSS).
+    """
     import io
 
     import currency
-    import fonts
 
     checks: list[dict] = []
 
     def add(name: str, ok: bool, detail: str):
         checks.append({"name": name, "ok": bool(ok), "detail": detail})
 
-    # 1) SQLite + WAL
+    # 1) Telegram Bot API
+    try:
+        me = _tg("getMe") or {}
+        wh = _tg("getWebhookInfo") or {}
+        member = _tg("getChatMember", json={"chat_id": cfg.channel,
+                                            "user_id": me.get("id")}) or {}
+        status = member.get("status")
+        can_post = member.get("can_post_messages")
+        ok = bool(me.get("username")) and status in ("administrator", "creator") \
+            and can_post is not False
+        add("[OK] Telegram Bot API", ok,
+            f"бот @%s · вебхук: %s · в канале %s: %s (can_post=%s)" % (
+                me.get("username") or "—",
+                wh.get("url") or "не установлен",
+                cfg.channel, status or "—", can_post))
+    except Exception as e:  # noqa
+        add("[OK] Telegram Bot API", False, f"ошибка: {_mask(e)}")
+
+    # 2) SQLite WAL: seen, posted, дубли
     try:
         st = _storage()
         mode = (st.conn.execute("PRAGMA journal_mode").fetchone() or [""])[0]
         total = st.seen_count()
         posted = st.posted_count()
-        add("SQLite (state.db, WAL)", str(mode).lower() == "wal",
-            f"режим {mode} · игр {total} · постов {posted}")
+        dupes = st.conn.execute(
+            "SELECT COUNT(*) FROM (SELECT appid FROM posted GROUP BY appid HAVING COUNT(*)>1)"
+        ).fetchone()[0]
+        pool = len(st.candidates(cfg.min_discount, cfg.min_score))
+        add("[OK] SQLite WAL", str(mode).lower() == "wal" and dupes == 0,
+            f"режим {mode} · seen {total} · posted {posted} · дублей {dupes} · пул {pool}")
     except Exception as e:  # noqa
-        add("SQLite (state.db, WAL)", False, f"ошибка: {_mask(e)}")
+        add("[OK] SQLite WAL", False, f"ошибка: {_mask(e)}")
 
-    # 2) Шрифты
-    try:
-        fonts.ensure_fonts()
-        fdir = os.path.join(cfg.assets_dir, "fonts")
-        have = [f for f in os.listdir(fdir)
-                if f.lower().endswith(".ttf")
-                and os.path.getsize(os.path.join(fdir, f)) > 20000]
-        add("Шрифты", len(have) >= 6, f"{len(have)} .ttf в assets/fonts")
-    except Exception as e:  # noqa
-        add("Шрифты", False, f"ошибка: {e}")
-
-    # 3) Pillow: карточка в памяти
-    try:
-        from PIL import Image, ImageDraw
-
-        img = Image.new("RGB", (640, 360), (18, 22, 32))
-        draw = ImageDraw.Draw(img)
-        draw.text((24, 24), "STEAM −90% 849 ₽", font=fonts.font("nbold", 28),
-                  fill=(255, 255, 255))
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        size = buf.tell()
-        add("Pillow / карточки", size > 2000, f"тестовая карточка {size} байт в памяти")
-    except Exception as e:  # noqa
-        add("Pillow / карточки", False, f"ошибка: {e}")
-
-    # 4) Курсы валют
+    # 3) Курсы валют USD/KZT/UAH к RUB
     try:
         rates = currency.get_rates()
         usd = float(rates.get("USD") or 0)
-        add("Курсы валют", usd > 0,
-            f"USD {usd:.2f} ₽ · KZT {rates.get('KZT', 0):.3f} ₽ · UAH {rates.get('UAH', 0):.2f} ₽")
+        kzt = float(rates.get("KZT") or 0)
+        uah = float(rates.get("UAH") or 0)
+        add("[OK] Курсы валют", usd > 0 and kzt > 0 and uah > 0,
+            f"1 USD = {usd:.2f} ₽ · 1 KZT = {kzt:.3f} ₽ · 1 UAH = {uah:.2f} ₽")
     except Exception as e:  # noqa
-        add("Курсы валют", False, f"ошибка: {e}")
+        add("[OK] Курсы валют", False, f"ошибка: {e}")
 
-    # 5) Сезонный ивент
+    # 4) Тестовая генерация всех 3 типов постов (БЕЗ публикации)
+    # 4a. multi: 4 кандидата + текст + мульти-карточка
     try:
-        add("Сезонный ивент", True, events.describe(_event()))
+        st = _storage()
+        cands = _pick(st.candidates(cfg.min_discount, cfg.min_score), 4)
+        test_ids = [g.appid for g in cands]
+        details = _enrich(cands)
+        games = [g for g in cands if g.appid in details]
+        cap, used = templates.multi_post(games, details) if len(games) >= 3 else ("", 0)
+        games = games[:used] if used else games
+        card = _multi_card(games, details, "multi") if len(games) >= 3 else ""
+        st.conn.execute(
+            "DELETE FROM posted WHERE ptype='picked' AND appid IN (%s)" %
+            ",".join("?" * len(test_ids)), test_ids)
+        st.conn.commit()
+        ok = len(games) >= 3 and bool(cap) and bool(card)
+        add("[OK] Тест генерации multi", ok,
+            f"{len(games)} игр · текст {templates.vlen(cap)} симв. · "
+            f"карточка {'есть' if card else 'НЕТ'}")
     except Exception as e:  # noqa
-        add("Сезонный ивент", False, f"ошибка: {e}")
+        add("[OK] Тест генерации multi", False, f"ошибка: {e}")
 
-    # 6) Права бота в канале
+    # 4b. single: блок описания ОБЯЗАТЕЛЕН
     try:
-        me = _tg("getMe") or {}
-        member = _tg("getChatMember", json={"chat_id": cfg.channel,
-                                            "user_id": me.get("id")}) or {}
-        status = member.get("status")
-        can_post = member.get("can_post_messages")
-        ok = status in ("administrator", "creator") and can_post is not False
-        add("Права бота в канале", ok,
-            f"{cfg.channel} · статус {status or '—'} · can_post_messages={can_post}")
+        st = _storage()
+        game = details = None
+        test_ids: list[int] = []
+        for _ in range(8):
+            cand = _pick(st.candidates(cfg.min_discount, cfg.min_score), 1)
+            if not cand:
+                break
+            test_ids.append(cand[0].appid)
+            d = _enrich(cand).get(cand[0].appid)
+            pr = d.get("price_ru") or {}
+            if d and (pr.get("final") or 0) > 0:
+                sent = templates.description(d)
+                if sent:
+                    game, details = cand[0], d
+                    break
+        if not game:
+            raise RuntimeError("нет подходящего кандидата")
+        desc = templates.description(details)
+        cap = templates.single_post(game, details)
+        card = _card(game, details, "single", details.get("name") or game.title)
+        st.conn.execute(
+            "DELETE FROM posted WHERE ptype='picked' AND appid IN (%s)" %
+            ",".join("?" * len(test_ids)), test_ids)
+        st.conn.commit()
+        ok = bool(desc) and 120 <= templates.vlen(desc) <= 220 \
+            and "<blockquote>" in cap and bool(card)
+        add("[OK] Тест генерации single", ok,
+            f"{game.title[:38]} · описание {templates.vlen(desc)} симв. · "
+            f"blockquote {'есть' if '<blockquote>' in cap else 'НЕТ'} · "
+            f"карточка {'есть' if card else 'НЕТ'}")
+        for p in (card,):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
     except Exception as e:  # noqa
-        add("Права бота в канале", False, f"ошибка: {_mask(e)}")
+        add("[OK] Тест генерации single", False, f"ошибка: {e}")
 
-    # 7) Свободное место на диске
+    # 4c. news: RSS → статья → подпись → карточка
     try:
-        free = shutil.disk_usage(cfg.img_dir).free / (1024 ** 3)
-        add("Диск", free > 0.2, f"свободно {free:.2f} ГБ")
+        items = news_mod.fetch_all()
+        st = _storage()
+        art = news_mod.pick_article(st.is_news_posted) if items else None
+        cap = templates.news_post(art) if art else ""
+        img = news_mod.image_path(art) if art else None
+        ok = len(items) > 0 and bool(art) and bool(cap) and bool(img) \
+            and "<blockquote>" in cap
+        add("[OK] Тест генерации news", ok,
+            f"RSS-статей {len(items)} · «{(art or {}).get('title', '')[:45]}» · "
+            f"подпись {templates.vlen(cap)} симв. · картинка {'есть' if img else 'НЕТ'}")
+        for p in (img,):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
     except Exception as e:  # noqa
-        add("Диск", False, f"ошибка: {e}")
+        add("[OK] Тест генерации news", False, f"ошибка: {e}")
 
     return checks
 

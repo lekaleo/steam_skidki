@@ -13,13 +13,14 @@
 import html
 import logging
 import sys
+import threading
 import time
 from datetime import datetime
 
 import security
 import templates
 from config import cfg
-from poster import POSTERS, sync, _storage, _tg, maybe_cleanup
+from poster import POSTERS, sync, _storage, _tg, cleanup_images
 import moderator
 
 security.install()
@@ -28,7 +29,7 @@ log = logging.getLogger("bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 security.install()  # повесить фильтр и на хендлеры basicConfig
 
-WINDOW_H = 3.5  # сколько часов после слота ещё считается «сейчас»
+STALE_H = 2.0  # слот, наступивший больше 2 часов назад, помечается пропущенным
 
 
 def now() -> datetime:
@@ -43,16 +44,31 @@ def sync_if_needed(force=False) -> int:
     st = _storage()
     last = st.kv_get_json("last_sync") or {}
     last_ts = last.get("last_sync", 0)
-    if force or time.time() - last_ts > cfg.sync_hours * 3600:
+    seen_empty = st.seen_count() == 0
+    if force or seen_empty or time.time() - last_ts > cfg.sync_hours * 3600:
         return sync()
     log.info("Sync не нужен (последний %s)", datetime.fromtimestamp(last_ts, cfg.tz).strftime("%d.%m %H:%M") if last_ts else "никогда")
     return 0
 
 
 def run_once(force_kind: str | None = None) -> int:
-    """Одноразовый режим для serverless-cron."""
+    """Одноразовый режим для serverless-cron: делает ВСЁ за один запуск."""
     cfg.ensure_dirs()
-    maybe_cleanup()   # раз в сутки: не даём папке images/ расти бесконечно
+    # 1) накопившиеся сообщения: команды владельцу + модерация комментариев
+    try:
+        n = process_pending_updates_once()
+        if n:
+            log.info("Обработано апдейтов Telegram: %d", n)
+    except Exception:  # noqa
+        log.exception("process_pending_updates_once failed")
+    # 2) чистим временные картинки (raw_*.jpg / card_*.jpg / multi_*.jpg),
+    #    чтобы диск никогда не забивался
+    try:
+        n = cleanup_images()
+        if n:
+            log.info("Убрано временных файлов images/: %d", n)
+    except Exception:  # noqa
+        log.exception("cleanup_images failed")
     sync_if_needed()
     st = _storage()
 
@@ -61,6 +77,7 @@ def run_once(force_kind: str | None = None) -> int:
         log.info("Принудительный пост %s: %s", force_kind, ok)
         return 0 if ok else 1
 
+    # 3) слот по расписанию?
     due = _schedule_due()
     if not due:
         log.info("Сейчас нет слота для поста — выходим")
@@ -68,21 +85,31 @@ def run_once(force_kind: str | None = None) -> int:
 
     hh, mm, kind = due[0]
     log.info("Слот %02d:%02d тянет пост: %s", hh, mm, kind)
-    ok = POSTERS[kind]()
+    day = now().strftime("%Y-%m-%d")
+    key = _slot_key(hh, mm, day)
+    st.kv_set(key, "1")  # флаг ДО поста: при сбое процесса повтор не случится
+    try:
+        ok = POSTERS[kind]()
+    except Exception:  # noqa
+        log.exception("Ошибка в посте %s", kind)
+        st.kv_del(key)
+        return 1
     if ok:
-        st.kv_set(_slot_key(hh, mm, now().strftime("%Y-%m-%d")), "1")
         log.info("✅ Опубликовано")
         return 0
     log.warning("❌ Не удалось опубликовать %s", kind)
     return 1
 
 
-def _schedule_due(last: dict | None = None) -> list[tuple[int, int, str]]:
+def _schedule_due() -> list[tuple[int, int, str]]:
     """Слоты, которые уже наступили и ещё НЕ отработали сегодня.
 
-    Возвращает (hh, mm, kind) — каждый слот считается отдельно по своему времени.
-    Факт публикации хранится в kv как done:YYYY-MM-DD:HH:MM, поэтому даже
-    перезапуск процесса не приведёт к повторному посту того же слота.
+    Возвращает (hh, mm, kind) — каждый слот считается отдельно по своему
+    времени, поэтому 15:00 single и 21:00 single никогда не путаются.
+    Факт публикации хранится ТОЛЬКО в SQLite (done:YYYY-MM-DD:HH:MM), поэтому
+    перезапуск процесса не приводит к повторному посту. Слот, наступивший
+    больше STALE_H часов назад, помечается пропущенным — чтобы после простоя
+    бот не вываливал все накопившиеся посты разом.
     """
     cur = now()
     day = cur.strftime("%Y-%m-%d")
@@ -94,39 +121,38 @@ def _schedule_due(last: dict | None = None) -> list[tuple[int, int, str]]:
         slot_dt = cur.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if slot_dt > cur:
             continue
-        if (cur - slot_dt).total_seconds() > WINDOW_H * 3600:
+        key = _slot_key(hh, mm, day)
+        if st.kv_get(key):
             continue
-        if st.kv_get(_slot_key(hh, mm, day)) == "1":
-            continue
-        if last and last.get(f"{hh:02d}:{mm:02d}") == day:
+        age_h = (cur - slot_dt).total_seconds() / 3600
+        if age_h > STALE_H:
+            st.kv_set(key, "missed")
+            log.info("Слот %02d:%02d (%s) пропущен: прошло %.1f ч", hh, mm, kind, age_h)
             continue
         due.append((hh, mm, kind))
     return due
 
 
 def scheduler_loop():
-    last: dict = {}
-    last_sync = 0.0
     while True:
         try:
-            if cfg.sync_hours and time.time() - last_sync > cfg.sync_hours * 3600:
-                sync()
-                last_sync = time.time()
+            # первичный и периодический sync — в фоне, без блокировки старта
+            sync_if_needed()
 
-            st = _storage()
-            for hh, mm, kind in _schedule_due(last):
-                key = f"{hh:02d}:{mm:02d}"
+            for hh, mm, kind in _schedule_due():
                 day = now().strftime("%Y-%m-%d")
-                log.info("Сработал слот %s (%s)", key, kind)
+                key = _slot_key(hh, mm, day)
+                log.info("Сработал слот %02d:%02d (%s)", hh, mm, kind)
+                st = _storage()
+                st.kv_set(key, "1")  # флаг ДО поста: защита от зацикливания
                 try:
                     ok = POSTERS[kind]()
-                except Exception as e:  # noqa
-                    log.exception("Ошибка в посте %s: %s", kind, e)
+                except Exception:  # noqa
+                    log.exception("Ошибка в посте %s", kind)
+                    st.kv_del(key)   # сбой — слот можно повторить в следующем цикле
                     ok = False
                 if ok:
-                    st.kv_set(_slot_key(hh, mm, day), "1")
-                    last[key] = day
-                time.sleep(cfg.post_delay)
+                    time.sleep(cfg.post_delay)
 
             time.sleep(20)
         except Exception:  # noqa
@@ -202,12 +228,141 @@ def _claim_owner(uid: int, chat: int) -> bool:
     return True
 
 
+def process_update(u: dict):
+    """Обрабатывает один апдейт Telegram (команды в личке + модерация групп)."""
+    msg = u.get("message") or u.get("edited_message")
+    if not msg:
+        return
+    chat_obj = msg.get("chat") or {}
+    # 1) модерация чата обсуждений (группы комментов)
+    if chat_obj.get("type") in ("group", "supergroup"):
+        moderator.handle_update(u)
+        return
+    # 2) команды — только в личке
+    if chat_obj.get("type") != "private":
+        return
+    uid = msg["from"]["id"]
+    chat = msg["chat"]["id"]
+    text = (msg.get("text") or "").strip()
+    low = text.lower()
+
+    # первый написавший становится владельцем, если OWNER_ID не задан
+    _claim_owner(uid, chat)
+    owner = _owner_id()
+    is_admin_cmd = low.startswith(ADMIN_COMMANDS)
+
+    if is_admin_cmd and uid != owner:
+        _tg("sendMessage", json={
+            "chat_id": chat,
+            "text": ("⚠️ Доступ закрыт. Укажите ваш Telegram ID "
+                     f"({uid}) в переменной OWNER_ID в файле .env"),
+        })
+        return
+
+    if low.startswith("/status"):
+        reply = _status()
+    elif low.startswith("/check"):
+        reply = _check_reply()
+    elif low == "/sync":
+        # мгновенный ack, тяжёлая работа — в отдельном потоке
+        _tg("sendMessage", json={"chat_id": chat,
+                                 "text": "⏳ Принял команду, обновляю каталог скидок..."})
+
+        def _sync_job(c: int = chat):
+            try:
+                n = sync()
+                _tg("sendMessage", json={"chat_id": c,
+                                         "text": f"✅ Синхронизировано: {n} игр со скидками"})
+            except Exception:  # noqa
+                log.exception("sync job failed")
+        threading.Thread(target=_sync_job, daemon=True).start()
+        return
+    elif low.startswith("/emojis"):
+        reply = _emojis_reply()
+    elif low.startswith("/setemoji"):
+        reply = _set_emoji_cmd(msg, text)
+    elif low.startswith("/resetemojis"):
+        n = templates.reset_emojis()
+        reply = f"✅ Сброшено слотов: {n}. Вернулся стильный набор по умолчанию."
+    elif low.startswith("/emoji"):
+        reply = _emoji_ids(msg)
+    elif low.startswith("/post"):
+        parts = low.split()
+        kind = parts[1] if len(parts) > 1 else "single"
+        if kind not in POSTERS:
+            reply = "Форматы: " + " | ".join(POSTERS)
+        else:
+            # мгновенный ack (за доли секунды), генерация — в отдельном потоке,
+            # чтобы бот никогда не зависал на долгой сборке поста
+            _tg("sendMessage", json={"chat_id": chat,
+                                     "text": "⏳ Принял команду, собираю пост..."})
+
+            def _post_job(k: str = kind, c: int = chat):
+                try:
+                    ok = POSTERS[k]()
+                except Exception:  # noqa
+                    log.exception("ручной пост %s failed", k)
+                    ok = False
+                _tg("sendMessage", json={
+                    "chat_id": c,
+                    "text": (f"✅ Пост {k} опубликован" if ok
+                             else "❌ Не получилось (нет кандидатов?)"),
+                })
+            threading.Thread(target=_post_job, daemon=True).start()
+            return
+    elif low.startswith(("/start", "/help")):
+        reply = HELP_TEXT
+    else:
+        reply = None
+
+    if reply and chat:
+        _tg("sendMessage", json={"chat_id": chat, "text": reply, "parse_mode": "HTML"})
+        return
+
+    # 3) владелец просто прислал premium-эмодзи — подсказываем слоты
+    ids = _custom_emoji_ids(msg)
+    if ids and owner and uid == owner:
+        _tg("sendMessage", json={
+            "chat_id": chat,
+            "parse_mode": "HTML",
+            "text": ("✨ Поймал premium-эмодзи.\n"
+                     "Сохраните его в слот:\n"
+                     "<code>/setemoji fire </code>" + msg.get("text", "")[:8] +
+                     "\n\nСлоты: " + ", ".join(templates.EMOJI_SLOTS)),
+        })
+
+
+def process_pending_updates_once() -> int:
+    """Одноразово забирает накопившиеся апдейты (getUpdates, без long-poll).
+
+    Используется в режиме --once: отвечает владельцу на команды, модерит
+    комментарии. Offset хранится в SQLite, поэтому апдейты не теряются и
+    не обрабатываются дважды между запусками.
+    """
+    _drop_webhook()
+    st = _storage()
+    offset = int(st.kv_get("tg_offset") or 0)
+    updates = _tg("getUpdates", json={"offset": offset, "timeout": 0}) or []
+    n = 0
+    for u in updates:
+        offset = u["update_id"] + 1
+        try:
+            process_update(u)
+        except Exception:  # noqa
+            log.exception("Ошибка обработки апдейта %s", u.get("update_id"))
+        n += 1
+    if updates:
+        st.kv_set("tg_offset", str(offset))
+    return n
+
+
 def command_handler():
     me = _tg("getMe")
     if me:
         log.info("Бот: @%s", me.get("username"))
     _drop_webhook()
-    offset = 0
+    st = _storage()
+    offset = int(st.kv_get("tg_offset") or 0)
     while True:
         try:
             updates = _tg("getUpdates", json={"offset": offset, "timeout": 25})
@@ -216,77 +371,8 @@ def command_handler():
                 continue
             for u in updates:
                 offset = u["update_id"] + 1
-                msg = u.get("message") or u.get("edited_message")
-                if not msg:
-                    continue
-                chat_obj = msg.get("chat") or {}
-                # 1) модерация чата обсуждений (группы комментов)
-                if chat_obj.get("type") in ("group", "supergroup"):
-                    moderator.handle_update(u)
-                    continue
-                # 2) команды — только в личке
-                if chat_obj.get("type") != "private":
-                    continue
-                uid = msg["from"]["id"]
-                chat = msg["chat"]["id"]
-                text = (msg.get("text") or "").strip()
-                low = text.lower()
-
-                # первый написавший становится владельцем, если OWNER_ID не задан
-                _claim_owner(uid, chat)
-                owner = _owner_id()
-                is_admin_cmd = low.startswith(ADMIN_COMMANDS)
-
-                if is_admin_cmd and uid != owner:
-                    _tg("sendMessage", json={
-                        "chat_id": chat,
-                        "text": ("⚠️ Доступ закрыт. Укажите ваш Telegram ID "
-                                 f"({uid}) в переменной OWNER_ID в файле .env"),
-                    })
-                    continue
-
-                reply = None
-                if low.startswith("/status"):
-                    reply = _status()
-                elif low.startswith("/check"):
-                    reply = _check_reply()
-                elif low == "/sync":
-                    n = sync()
-                    reply = f"✅ Синхронизировано: {n} игр со скидками"
-                elif low.startswith("/emojis"):
-                    reply = _emojis_reply()
-                elif low.startswith("/setemoji"):
-                    reply = _set_emoji_cmd(msg, text)
-                elif low.startswith("/resetemojis"):
-                    n = templates.reset_emojis()
-                    reply = f"✅ Сброшено слотов: {n}. Вернулся стильный набор по умолчанию."
-                elif low.startswith("/emoji"):
-                    reply = _emoji_ids(msg)
-                elif low.startswith("/post"):
-                    parts = low.split()
-                    kind = parts[1] if len(parts) > 1 else "single"
-                    if kind in POSTERS:
-                        ok = POSTERS[kind]()
-                        reply = f"✅ Пост {kind} опубликован" if ok else "❌ Не получилось (нет кандидатов?)"
-                    else:
-                        reply = "Форматы: " + " | ".join(POSTERS)
-                elif low.startswith(("/start", "/help")):
-                    reply = HELP_TEXT
-                if reply and chat:
-                    _tg("sendMessage", json={"chat_id": chat, "text": reply, "parse_mode": "HTML"})
-                    continue
-
-                # 3) владелец просто прислал premium-эмодзи — подсказываем слоты
-                ids = _custom_emoji_ids(msg)
-                if ids and owner and uid == owner:
-                    _tg("sendMessage", json={
-                        "chat_id": chat,
-                        "parse_mode": "HTML",
-                        "text": ("✨ Поймал premium-эмодзи.\n"
-                                 "Сохраните его в слот:\n"
-                                 "<code>/setemoji fire </code>" + msg.get("text", "")[:8] +
-                                 "\n\nСлоты: " + ", ".join(templates.EMOJI_SLOTS)),
-                    })
+                process_update(u)
+            st.kv_set("tg_offset", str(offset))
         except Exception:  # noqa
             log.exception("Ошибка в обработчике команд")
             time.sleep(5)
@@ -457,12 +543,11 @@ def _start_daemon(secs: int | None = None):
         log.error("Нет BOT_TOKEN в .env — скопируй .env.example в .env и заполни")
         raise SystemExit(2)
 
-    try:
-        sync()
-    except Exception:  # noqa
-        log.exception("Первичный sync не удался")
-
-    import threading
+    # НИКАКОГО блокирующего sync() перед потоками! Сначала сброс вебхука
+    # (чтобы getUpdates не ловил 409), затем сразу оба потока — команды
+    # владельца отвечают мгновенно. Первичный sync делает scheduler_loop
+    # в фоне через sync_if_needed().
+    _drop_webhook()
     t1 = threading.Thread(target=scheduler_loop, daemon=True)
     t2 = threading.Thread(target=command_handler, daemon=True)
     t1.start()
