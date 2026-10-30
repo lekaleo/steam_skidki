@@ -1,22 +1,27 @@
 name: autopost
 
-# Автономная работа без ПК: 4 поста в день по слотам (МСК).
-#   • 12:00 multi · 15:00 single · 18:00 news · 21:00 single
-#   • cron: 09:00 / 12:00 / 15:00 / 18:00 UTC = 12/15/18/21 МСК
-#   • data/state.db коммитится обратно в репозиторий после каждого запуска:
-#     таблица posted живёт вечно -> игры НИКОГДА не повторяются.
-#   • этот workflow — ЕДИНСТВЕННЫЙ, кто пишет в базу и в Telegram.
-#     Команды владельца слушает отдельный workflow listen.yml (только чтение).
+# Бот работает в облаке круглосуточно, без ПК.
+#
+# Почему не просто cron: планировщик GitHub на новом репозитории срабатывает
+# крайне нерегулярно (проверено: cron */5 за 25 минут — 0 запусков). Поэтому
+# каждое окно бота (~3 часа) в конце САМО запускает следующее окно через
+# GitHub API — цепочка не прерывается. Cron остаётся страховкой: если цепочка
+# оборвалась, он поднимет бота снова.
+#
+# Внутри окна бот публикует ровно 4 поста в день по слотам (МСК):
+#   12:00 multi · 15:00 single · 18:00 news · 21:00 single
+# и всё это время слушает команды владельца в личке (/status /check /post ...).
 
 on:
   schedule:
+    # страховка на случай обрыва цепочки
+    - cron: "0 */3 * * *"
+    # слоты публикаций (09/12/15/18 UTC = 12/15/18/21 МСК)
     - cron: "0 9,12,15,18 * * *"
-  # ручной запуск: auto — как по расписанию; single/multi/news — принудительный
-  # пост; preview-news — проверка новости без публикации.
   workflow_dispatch:
     inputs:
       mode:
-        description: "auto | single | multi | news | preview-news"
+        description: "auto | single | multi | news | preview-news | probe"
         type: choice
         default: auto
         options:
@@ -25,19 +30,21 @@ on:
           - multi
           - news
           - preview-news
+          - probe
 
 permissions:
   contents: write
+  actions: write      # нужно для самозапуска следующего окна
 
-# никаких параллельных запусков: база не может сливаться одновременно
+# auto-окна идут строго по очереди; ручные проверки — отдельной группой
 concurrency:
-  group: steam-post
+  group: steam-bot-${{ github.event.inputs.mode || 'auto' }}
   cancel-in-progress: false
 
 jobs:
-  post:
+  bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 200
     env:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       CHANNEL: ${{ secrets.CHANNEL }}
@@ -81,15 +88,10 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Selfcheck (только при ручном запуске)
-        if: github.event_name == 'workflow_dispatch'
-        continue-on-error: true
+      # ---------- ручные режимы (для проверок) ----------
+      - name: Selfcheck
+        if: env.MODE == 'probe'
         run: python run_bot.py --selfcheck
-
-      # публикует ОДИН пост, если сейчас есть слот (12:00/15:00/18:00/21:00)
-      - name: Publish one post (по расписанию)
-        if: env.MODE == 'auto'
-        run: python run_bot.py --once
 
       - name: Publish forced post
         if: env.MODE == 'single' || env.MODE == 'multi' || env.MODE == 'news'
@@ -99,7 +101,16 @@ jobs:
         if: env.MODE == 'preview-news'
         run: python preview_news.py
 
-      # база уезжает в репозиторий: история опубликованного хранится навсегда
+      # ---------- основное: окно работы бота ----------
+      - name: Бот работает (окно ~3 часа)
+        if: env.MODE == 'auto'
+        run: timeout --signal=INT 11350 python run_bot.py --serve 11200 || true
+
+      - name: Проба цепочки (2 минуты)
+        if: env.MODE == 'probe'
+        run: timeout --signal=INT 200 python run_bot.py --serve 120 || true
+
+      # ---------- сохранить историю ----------
       - name: Persist state.db in repository
         if: always()
         run: |
@@ -117,11 +128,6 @@ jobs:
 
           git config user.name "steam-bot"
           git config user.email "bot@users.noreply.github.com"
-          if git diff --quiet -- data/state.db 2>/dev/null && git ls-files --error-unmatch data/state.db >/dev/null 2>&1; then
-            echo "state.db не изменился"
-            exit 0
-          fi
-
           cp data/state.db /tmp/state.db.new
           for i in 1 2 3; do
             git fetch origin main
@@ -129,7 +135,7 @@ jobs:
             cp /tmp/state.db.new data/state.db
             git add -f data/state.db
             if git diff --cached --quiet; then
-              echo "нечего коммитить"
+              echo "state.db не изменился"
               exit 0
             fi
             git commit -m "state: база опубликованных игр и новостей [skip ci]"
@@ -141,3 +147,10 @@ jobs:
           done
           echo "не удалось запушить state.db" >&2
           exit 1
+
+      # ---------- цепочка: следующее окно ----------
+      - name: Запустить следующее окно
+        if: always() && (env.MODE == 'auto' || env.MODE == 'probe')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run autopost.yml --repo "${{ github.repository }}" -f mode=auto

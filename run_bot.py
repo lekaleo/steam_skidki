@@ -440,6 +440,18 @@ def main():
         cfg.ensure_dirs()
         raise SystemExit(run_once(force_kind=args[1]))
 
+    if args and args[0] == "--serve":
+        # окно работы бота (используется в GitHub Actions): публикует по слотам
+        # и слушает команды N секунд, затем выходит. Следующее окно запускает
+        # сам workflow — так бот работает круглосуточно без cron каждые 5 минут.
+        secs = int(args[1]) if len(args) > 1 and args[1].isdigit() else 3600
+        _start_daemon(secs)
+        return
+
+    _start_daemon()
+
+
+def _start_daemon(secs: int | None = None):
     cfg.ensure_dirs()
     if not cfg.bot_token:
         log.error("Нет BOT_TOKEN в .env — скопируй .env.example в .env и заполни")
@@ -455,8 +467,13 @@ def main():
     t2 = threading.Thread(target=command_handler, daemon=True)
     t1.start()
     t2.start()
-    log.info("Бот запущен 24/7. Канал: %s | расписание: %s", cfg.channel,
+    log.info("Бот запущен%s. Канал: %s | расписание: %s",
+             f" на {secs} с" if secs else " 24/7", cfg.channel,
              ", ".join(f"{s['time'][0]:02d}:{s['time'][1]:02d} {s['kind']}" for s in cfg.schedule))
+    if secs:
+        time.sleep(secs)
+        log.info("Окно работы закончилось — выходим, следующее запустит workflow")
+        raise SystemExit(0)
     while True:
         time.sleep(60)
 
