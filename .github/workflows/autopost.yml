@@ -1,30 +1,39 @@
 name: autopost
 
-# Полностью бесплатный serverless-запуск: GitHub Actions по расписанию.
-# ПК выключен — посты всё равно публикуются.
-#
-# Что кэшируется между запусками (иначе бот теряет память и качает шрифты заново):
-#   data/state.db     — база скидок, «что уже постили», эмодзи-слоты, страйки
-#   data/rates.json   — курсы валют ЦБ (суточный кэш)
-#   assets/fonts/     — Montserrat / Noto Sans для карточек
+# Автономная работа без ПК: 4 поста в день по слотам (МСК).
+#   • 12:00 multi · 15:00 single · 18:00 news · 21:00 single
+#   • 09:00 / 12:00 / 15:00 / 18:00 UTC
+#   • data/state.db коммитится обратно в репозиторий после каждого запуска:
+#     таблица posted живёт вечно -> игры НИКОГДА не повторяются.
 
 on:
   schedule:
-    # каждые 3 часа (UTC). Слоты расписания задаются в MSK внутри .env/секретов.
-    - cron: "0 */3 * * *"
-  workflow_dispatch: {}   # кнопка "Run workflow" для ручного запуска
+    - cron: "0 9,12,15,18 * * *"
+  workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: steam-autopost
+  group: steam-telegram
   cancel-in-progress: false
 
 jobs:
   post:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      CHANNEL: ${{ secrets.CHANNEL }}
+      CHANNEL_TITLE: ${{ secrets.CHANNEL_TITLE }}
+      OWNER_ID: ${{ secrets.OWNER_ID }}
+      SCHEDULE: ${{ vars.SCHEDULE }}
+      MIN_DISCOUNT: "15"
+      MIN_SCORE: "0"
+      MAX_SEARCH_PAGES: "80"
+      SYNC_HOURS: "4"
+      TIMEZONE_OFFSET: "3"
+      PREMIUM_EMOJI: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,16 +43,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 1) база состояния: что постили, эмодзи-слоты, страйки модератора
-      - name: Restore state.db
-        uses: actions/cache@v4
-        with:
-          path: data/state.db
-          key: steamdb-state-${{ github.run_id }}
-          restore-keys: |
-            steamdb-state-
-
-      # 2) курсы валют (обновляются раз в сутки внутри бота)
       - name: Restore currency rates
         uses: actions/cache@v4
         with:
@@ -52,7 +51,6 @@ jobs:
           restore-keys: |
             steamdb-rates-
 
-      # 3) шрифты карточек — качаются один раз, дальше берутся из кэша
       - name: Restore fonts
         uses: actions/cache@v4
         with:
@@ -67,23 +65,35 @@ jobs:
       - name: Selfcheck (только ручной запуск)
         if: github.event_name == 'workflow_dispatch'
         continue-on-error: true
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHANNEL: ${{ secrets.CHANNEL }}
-          OWNER_ID: ${{ secrets.OWNER_ID }}
         run: python run_bot.py --selfcheck
 
       - name: Publish one post (если сейчас есть слот)
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHANNEL: ${{ secrets.CHANNEL }}
-          CHANNEL_TITLE: ${{ secrets.CHANNEL_TITLE }}
-          OWNER_ID: ${{ secrets.OWNER_ID }}
-          SCHEDULE: ${{ vars.SCHEDULE }}
-          MIN_DISCOUNT: "15"
-          MIN_SCORE: "0"
-          MAX_SEARCH_PAGES: "40"
-          SYNC_HOURS: "6"
-          TIMEZONE_OFFSET: "3"
-          PREMIUM_EMOJI: "1"
         run: python run_bot.py --once
+
+      - name: Listen for commands
+        continue-on-error: true
+        run: timeout --signal=INT 240 python run_bot.py --listen 220 || true
+
+      - name: Persist state.db in repository
+        if: always()
+        run: |
+          python - <<'PY'
+          import sqlite3
+          try:
+              c = sqlite3.connect("data/state.db")
+              c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+              c.commit()
+              c.close()
+          except Exception as e:
+              print("checkpoint:", e)
+          PY
+          git config user.name "steam-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -f data/state.db
+          if git diff --cached --quiet; then
+            echo "state.db не изменился"
+          else
+            git commit -m "state: база опубликованных игр и новостей [skip ci]"
+            git pull --rebase --autostash origin main
+            git push
+          fi
