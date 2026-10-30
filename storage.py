@@ -197,8 +197,12 @@ class Storage:
     def mark_posted(self, appids: list[int], ptype: str):
         now = int(time.time())
         for a in appids:
+            # уже помеченную при выборе игру переводим в реальный тип поста,
+            # чтобы по базе было видно, что именно ушло в канал
             self.conn.execute(
-                "INSERT OR IGNORE INTO posted(appid,posted_at,ptype) VALUES(?,?,?)", (a, now, ptype)
+                "INSERT INTO posted(appid,posted_at,ptype) VALUES(?,?,?) "
+                "ON CONFLICT(appid) DO UPDATE SET ptype=excluded.ptype",
+                (a, now, ptype),
             )
         self.conn.commit()
 
