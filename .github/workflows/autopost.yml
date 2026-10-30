@@ -11,7 +11,20 @@ name: autopost
 on:
   schedule:
     - cron: "0 9,12,15,18 * * *"
-  workflow_dispatch: {}
+  # ручной запуск: auto — как по расписанию; single/multi/news — принудительный
+  # пост; preview-news — проверка новости без публикации.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "auto | single | multi | news | preview-news"
+        type: choice
+        default: auto
+        options:
+          - auto
+          - single
+          - multi
+          - news
+          - preview-news
 
 permissions:
   contents: write
@@ -38,6 +51,7 @@ jobs:
       TIMEZONE_OFFSET: "3"
       PREMIUM_EMOJI: "1"
       CAPTION_LIMIT: "1000"
+      MODE: ${{ github.event.inputs.mode || 'auto' }}
     steps:
       - name: Checkout (вместе с data/state.db из репозитория)
         uses: actions/checkout@v4
@@ -73,8 +87,17 @@ jobs:
         run: python run_bot.py --selfcheck
 
       # публикует ОДИН пост, если сейчас есть слот (12:00/15:00/18:00/21:00)
-      - name: Publish one post
+      - name: Publish one post (по расписанию)
+        if: env.MODE == 'auto'
         run: python run_bot.py --once
+
+      - name: Publish forced post
+        if: env.MODE == 'single' || env.MODE == 'multi' || env.MODE == 'news'
+        run: python run_bot.py --force ${{ env.MODE }}
+
+      - name: Preview news (без публикации)
+        if: env.MODE == 'preview-news'
+        run: python preview_news.py
 
       # база уезжает в репозиторий: история опубликованного хранится навсегда
       - name: Persist state.db in repository

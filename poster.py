@@ -148,6 +148,8 @@ def send_photo(caption: str, photo_path: str, reply_markup: dict | None = None) 
             log.error("sendPhoto request error: %s", _mask(e))
             return False
         if resp.get("ok"):
+            msg_id = (resp.get("result") or {}).get("message_id")
+            log.info("Пост в канале: message_id=%s, вариант «%s»", msg_id, name)
             if i:
                 log.warning("sendPhoto отправлен вариантом «%s» (причина: %s)", name, _mask(last_err))
             return True
