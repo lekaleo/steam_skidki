@@ -65,7 +65,7 @@ jobs:
             steamdb-fonts-
 
       - name: Install deps
-        run: pip install --no-cache-dir -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Selfcheck (только при ручном запуске)
         if: github.event_name == 'workflow_dispatch'

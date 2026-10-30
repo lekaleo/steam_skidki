@@ -39,7 +39,7 @@ jobs:
           cache: pip
 
       - name: Install deps
-        run: pip install --no-cache-dir -r requirements.txt
+        run: pip install -r requirements.txt
 
       # getMe + deleteWebhook + приём команд (/status /check /post /sync /emojis)
       - name: Listen for Telegram commands
