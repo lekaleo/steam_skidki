@@ -2,9 +2,11 @@ name: autopost
 
 # Автономная работа без ПК: 4 поста в день по слотам (МСК).
 #   • 12:00 multi · 15:00 single · 18:00 news · 21:00 single
-#   • 09:00 / 12:00 / 15:00 / 18:00 UTC
+#   • cron: 09:00 / 12:00 / 15:00 / 18:00 UTC = 12/15/18/21 МСК
 #   • data/state.db коммитится обратно в репозиторий после каждого запуска:
 #     таблица posted живёт вечно -> игры НИКОГДА не повторяются.
+#   • этот workflow — ЕДИНСТВЕННЫЙ, кто пишет в базу и в Telegram.
+#     Команды владельца слушает отдельный workflow listen.yml (только чтение).
 
 on:
   schedule:
@@ -14,14 +16,15 @@ on:
 permissions:
   contents: write
 
+# никаких параллельных запусков: база не может сливаться одновременно
 concurrency:
-  group: steam-telegram
+  group: steam-post
   cancel-in-progress: false
 
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       CHANNEL: ${{ secrets.CHANNEL }}
@@ -34,14 +37,16 @@ jobs:
       SYNC_HOURS: "4"
       TIMEZONE_OFFSET: "3"
       PREMIUM_EMOJI: "1"
+      CAPTION_LIMIT: "1000"
     steps:
-      - name: Checkout
+      - name: Checkout (вместе с data/state.db из репозитория)
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Restore currency rates
         uses: actions/cache@v4
@@ -62,18 +67,16 @@ jobs:
       - name: Install deps
         run: pip install --no-cache-dir -r requirements.txt
 
-      - name: Selfcheck (только ручной запуск)
+      - name: Selfcheck (только при ручном запуске)
         if: github.event_name == 'workflow_dispatch'
         continue-on-error: true
         run: python run_bot.py --selfcheck
 
-      - name: Publish one post (если сейчас есть слот)
+      # публикует ОДИН пост, если сейчас есть слот (12:00/15:00/18:00/21:00)
+      - name: Publish one post
         run: python run_bot.py --once
 
-      - name: Listen for commands
-        continue-on-error: true
-        run: timeout --signal=INT 240 python run_bot.py --listen 220 || true
-
+      # база уезжает в репозиторий: история опубликованного хранится навсегда
       - name: Persist state.db in repository
         if: always()
         run: |
@@ -87,13 +90,31 @@ jobs:
           except Exception as e:
               print("checkpoint:", e)
           PY
+          test -f data/state.db || exit 0
+
           git config user.name "steam-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add -f data/state.db
-          if git diff --cached --quiet; then
+          if git diff --quiet -- data/state.db 2>/dev/null && git ls-files --error-unmatch data/state.db >/dev/null 2>&1; then
             echo "state.db не изменился"
-          else
-            git commit -m "state: база опубликованных игр и новостей [skip ci]"
-            git pull --rebase --autostash origin main
-            git push
+            exit 0
           fi
+
+          cp data/state.db /tmp/state.db.new
+          for i in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            cp /tmp/state.db.new data/state.db
+            git add -f data/state.db
+            if git diff --cached --quiet; then
+              echo "нечего коммитить"
+              exit 0
+            fi
+            git commit -m "state: база опубликованных игр и новостей [skip ci]"
+            if git push origin HEAD:main; then
+              echo "state.db сохранена в репозитории"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "не удалось запушить state.db" >&2
+          exit 1
