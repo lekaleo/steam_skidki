@@ -41,6 +41,8 @@ KIND_LABEL = {
     # новинки и релизы
     "releases": "НОВИНКИ И РЕЛИЗЫ",
     "upcoming": "СКОРО В STEAM",
+    # игровые новости
+    "news": "НОВОСТИ ИГР",
     # сезонные события (events.py -> kind карточки)
     "halloween": "ХЭЛЛОУИН В STEAM",
     "autumn": "ОСЕННЯЯ РАСПРОДАЖА",
@@ -464,6 +466,59 @@ def make_multi_card(games_data, out_path, handle, kind="multi"):
     _telegram_glyph(c, 74, fy + 18, 19, (255, 255, 255))
     c.text((102, fy + 18), "@" + handle, "bold", 24, WHITE, anchor="lm")
     c.text((1224, fy + 18), "Steam-скидки · ежедневно", "nreg", 21, MUTED2, anchor="rm")
+
+    c.save(out_path, quality=95)
+    return True
+
+
+def make_news_card(image_path, out_path, handle, title="", source=""):
+    """Карточка новости: обложка статьи + плашка «НОВОСТИ ИГР» + заголовок."""
+    W, H = cfg.card_w, cfg.card_h
+    fonts.ensure_fonts()
+
+    art = None
+    if image_path and os.path.exists(image_path):
+        try:
+            art = Image.open(image_path).convert("RGB")
+        except OSError:
+            art = None
+    if art is None:
+        art = Image.new("RGB", (1200, 675), (26, 34, 50))
+
+    bg = _cover(art, W * K, H * K).filter(ImageFilter.GaussianBlur(36))
+    dark = Image.new("RGBA", (W * K, H * K), (10, 12, 18, 220))
+    bg = Image.alpha_composite(bg.convert("RGBA"), dark)
+    bg.alpha_composite(_vgrad(W, H, (0, 0, 0, 0), (10, 13, 20, 252)), (0, int(H * 0.28 * K)))
+    c = Canvas(W, H, base=bg)
+
+    # плашка рубрики
+    label = KIND_LABEL.get("news", "НОВОСТИ ИГР")
+    pill_w = c.textlen(label, "semi", 22) + 56
+    c.rrect([56, 22, 56 + pill_w, 62], 14, fill=(30, 43, 63, 230),
+            outline=(102, 192, 244, 120), width=2)
+    c.text((56 + 28, 42), label, "semi", 22, BLUE, anchor="lm")
+
+    # обложка новости
+    box = (56, 88, 1224, 470)
+    c.paste_rounded(art, box, 18)
+    c.rrect(box, 18, outline=(102, 192, 244, 70), width=2)
+
+    # заголовок над футером
+    lines = _wrap(c, title or "Новость игрового мира", "nbold", 40, 1130, max_lines=3)
+    ty = 512
+    for ln in lines:
+        c.text((56, ty), ln, "nbold", 40, WHITE)
+        ty += 52
+
+    # источник
+    if source:
+        c.text((56, ty + 8), source.upper(), "semi", 20, GREEN)
+
+    # футер
+    fy = 668
+    _telegram_glyph(c, 74, fy, 19, (255, 255, 255))
+    c.text((102, fy), "@" + handle, "bold", 24, WHITE, anchor="lm")
+    c.text((1224, fy), "Игровые новости · ежедневно", "nreg", 21, MUTED2, anchor="rm")
 
     c.save(out_path, quality=95)
     return True

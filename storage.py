@@ -62,6 +62,13 @@ class Storage:
                 posted_at INTEGER,
                 ptype TEXT
             );
+            -- новости: ключ = URL статьи, чтобы ни одна новость не повторилась
+            CREATE TABLE IF NOT EXISTS posted_news(
+                news_key TEXT PRIMARY KEY,
+                url TEXT,
+                title TEXT,
+                posted_at INTEGER
+            );
             CREATE TABLE IF NOT EXISTS kv(
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -200,6 +207,32 @@ class Storage:
 
     def is_posted(self, appid: int) -> bool:
         return self.conn.execute("SELECT 1 FROM posted WHERE appid=?", (appid,)).fetchone() is not None
+
+    def mark_skipped(self, appid: int, reason: str = "skipped"):
+        """Помечает игру как обработанную (не публикуя), чтобы бот не брал её снова."""
+        try:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO posted(appid,posted_at,ptype) VALUES(?,?,?)",
+                (int(appid), int(time.time()), reason),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            pass
+
+    # ---------- новости ----------
+    def is_news_posted(self, key: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM posted_news WHERE news_key=?", (key,)).fetchone() is not None
+
+    def mark_news_posted(self, key: str, url: str = "", title: str = ""):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO posted_news(news_key,url,title,posted_at) VALUES(?,?,?,?)",
+            (key, url, title, int(time.time())),
+        )
+        self.conn.commit()
+
+    def posted_news_count(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM posted_news").fetchone()[0]
 
     # ---------- kv ----------
     def kv_get(self, key: str, default: str = "") -> str:

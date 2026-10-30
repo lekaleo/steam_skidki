@@ -8,6 +8,7 @@
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import time
@@ -16,10 +17,11 @@ from datetime import datetime
 import requests
 
 import events
+import news as news_mod
 import security
 import templates
 from config import cfg
-from images import make_card, make_multi_card
+from images import make_card, make_multi_card, make_news_card
 from steam import (compute_score, download_image, fetch_game_details,
                    search_specials, search_upcoming_and_new)
 from storage import Game, Storage
@@ -203,15 +205,28 @@ def _ensure_candidates(n: int = 3):
         sync()
 
 
-def _pick(games: list[Game], n: int, exclude: set[int] | None = None) -> list[Game]:
+def _pick(games: list[Game], n: int, exclude: set[int] | None = None,
+          mark: bool = True, shuffle: bool = True) -> list[Game]:
+    """Выбирает n игр и СРАЗУ фиксирует их в posted (стопроцентная защита от повторов).
+
+    Топ-40 неопубликованных кандидатов перемешиваются, чтобы бот не брал одну и
+    ту же верхнюю строку при каждом запуске. Как только игра выбрана — она
+    попадает в таблицу posted и больше никогда не будет взята снова.
+    """
     exclude = exclude or set()
-    out = []
-    for g in games:
+    st = _storage()
+    pool = [g for g in games if g.appid not in exclude and not st.is_posted(g.appid)]
+    if shuffle and len(pool) > 1:
+        head = pool[:40]
+        random.shuffle(head)
+        pool = head + pool[40:]
+    out: list[Game] = []
+    for g in pool:
         if len(out) >= n:
             break
-        if g.appid in exclude or _storage().is_posted(g.appid):
-            continue
         out.append(g)
+        if mark:
+            st.mark_skipped(g.appid, "picked")
     return out
 
 
@@ -223,8 +238,11 @@ def _enrich(games: list[Game]) -> dict[int, dict]:
             d = fetch_game_details(g.appid)
         except Exception as e:  # noqa
             log.warning("details %s: %s", g.appid, _mask(e))
+            st.mark_skipped(g.appid, "details-error")
             continue
         if not d or d.get("type") in SKIP_TYPES:
+            # пустой ответ Steam — игру больше не трогаем, иначе она зациклит выбор
+            st.mark_skipped(g.appid, "details-empty")
             continue
         # обновляем вес игры по свежим данным (только для порядка очереди)
         sc = compute_score(
@@ -403,36 +421,85 @@ def _post_games(games, ptype, caption, card_path, markup=None, mark=True) -> boo
 # ---------------- форматы ----------------
 
 def post_single() -> bool:
-    _ensure_candidates(2)
-    cand = _pick(_event_priority(_storage().candidates(cfg.min_discount, cfg.min_score)), 1)
-    if not cand:
-        return False
-    game = cand[0]
-    details = _enrich([game]).get(game.appid)
-    if not details:
-        return False
-    caption = templates.single_post(game, details)
-    card = _card(game, details, "single", details.get("name") or game.title)
-    return _post_games([game], "single", caption, card,
-                       markup=_keyboard([game], details, "single"))
+    """Одиночный пост: игра ОБЯЗАТЕЛЬНО с русским описанием в 1–2 предложения."""
+    _ensure_candidates(6)
+    st = _storage()
+    for _ in range(10):
+        cand = _pick(_event_priority(st.candidates(cfg.min_discount, cfg.min_score)), 1)
+        if not cand:
+            log.warning("Кандидаты кончились — single опубликовать нечем")
+            return False
+        game = cand[0]
+        details = _enrich([game]).get(game.appid)
+        if not details:
+            continue  # _enrich уже пометил игру как skipped
+        sent = templates.description(details)
+        if not sent:
+            log.info("У %s нет русского описания — берём следующую", game.title)
+            st.mark_skipped(game.appid, "no-desc")
+            continue
+        caption = templates.single_post(game, details)
+        card = _card(game, details, "single", details.get("name") or game.title)
+        if not card:
+            log.warning("Карточка для %s не собралась", game.title)
+            return False
+        return _post_games([game], "single", caption, card,
+                           markup=_keyboard([game], details, "single"))
+    log.warning("Не нашли игру с описанием для single")
+    return False
 
 
 def post_multi() -> bool:
-    _ensure_candidates(5)
+    """Подборка РОВНО из 4 игр: мульти-карточка + список с ценами в 4 валютах."""
+    _ensure_candidates(8)
     cands = _pick(_event_priority(_storage().candidates(cfg.min_discount, cfg.min_score)), 4)
-    if len(cands) < 2:
+    if len(cands) < 4:
+        log.info("Меньше 4 кандидатов — публикуем одиночный пост")
         return post_single()
     details = _enrich(cands)
-    games = [g for g in cands if g.appid in details][:4]
-    if len(games) < 2:
+    games = [g for g in cands if g.appid in details]
+    if len(games) < 4:
+        log.info("Не у всех игр есть детали (%d из 4) — одиночный пост", len(games))
         return post_single()
     caption, used = templates.multi_post(games, details)
     games = games[:used]
     card = _multi_card(games, details, "multi")
     if not card:
-        return post_single()
+        log.warning("Мульти-карточка не собралась")
+        return False
     return _post_games(games, "multi", caption, card,
                        markup=_keyboard(games, details, "group"))
+
+
+def post_news() -> bool:
+    """Игровая новость дня: свежий RSS-материал + карточка «НОВОСТИ ИГР»."""
+    st = _storage()
+    article = news_mod.pick_article(st.is_news_posted)
+    if not article:
+        log.warning("Свежих неопубликованных новостей нет")
+        return False
+
+    caption = templates.news_post(article)
+    img = news_mod.image_path(article)
+    out = os.path.join(cfg.img_dir, f"card_news_{article['key']}.jpg")
+    if not make_news_card(img, out, cfg.channel_handle,
+                          article.get("title", ""), article.get("source", "")):
+        log.warning("Карточка новости не собралась")
+        return False
+
+    markup = {"inline_keyboard": [[{"text": "📰 Читать новость", "url": article["url"]}]]}
+    if not send_photo(caption, out, reply_markup=markup):
+        return False
+
+    st.mark_news_posted(article["key"], article["url"], article["title"])
+    log.info("Опубликована новость: %s (%s)", article["title"], article.get("source"))
+    for p in (out, img):
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    return True
 
 
 def post_series() -> bool:
@@ -804,6 +871,7 @@ def selfcheck() -> list[dict]:
 POSTERS = {
     "single": post_single,
     "multi": post_multi,
+    "news": post_news,
     "series": post_series,
     "roundup": post_roundup,
     "ending": post_ending,

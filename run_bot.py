@@ -55,55 +55,53 @@ def run_once(force_kind: str | None = None) -> int:
     maybe_cleanup()   # раз в сутки: не даём папке images/ расти бесконечно
     sync_if_needed()
     st = _storage()
-    cur = now()
-    day = cur.strftime("%Y-%m-%d")
 
     if force_kind:
         ok = POSTERS[force_kind]()
         log.info("Принудительный пост %s: %s", force_kind, ok)
         return 0 if ok else 1
 
-    # ищем слот, который уже наступил, ещё не отработал сегодня и попадает в окно
-    due = None
-    for slot in cfg.schedule:
-        hh, mm = slot["time"]
-        slot_dt = cur.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if slot_dt <= cur and (cur - slot_dt).total_seconds() <= WINDOW_H * 3600:
-            if st.kv_get(_slot_key(hh, mm, day)) != "1":
-                due = (hh, mm, slot["kind"])
-                break
-
+    due = _schedule_due()
     if not due:
         log.info("Сейчас нет слота для поста — выходим")
         return 0
 
-    hh, mm, kind = due
+    hh, mm, kind = due[0]
     log.info("Слот %02d:%02d тянет пост: %s", hh, mm, kind)
     ok = POSTERS[kind]()
     if ok:
-        st.kv_set(_slot_key(hh, mm, day), "1")
+        st.kv_set(_slot_key(hh, mm, now().strftime("%Y-%m-%d")), "1")
         log.info("✅ Опубликовано")
         return 0
     log.warning("❌ Не удалось опубликовать %s", kind)
     return 1
 
 
-def _schedule_due(last: dict) -> list[str]:
+def _schedule_due(last: dict | None = None) -> list[tuple[int, int, str]]:
+    """Слоты, которые уже наступили и ещё НЕ отработали сегодня.
+
+    Возвращает (hh, mm, kind) — каждый слот считается отдельно по своему времени.
+    Факт публикации хранится в kv как done:YYYY-MM-DD:HH:MM, поэтому даже
+    перезапуск процесса не приведёт к повторному посту того же слота.
+    """
     cur = now()
-    due = []
+    day = cur.strftime("%Y-%m-%d")
+    st = _storage()
+    due: list[tuple[int, int, str]] = []
     for slot in cfg.schedule:
         hh, mm = slot["time"]
-        fired = last.get(f"{hh:02d}:{mm:02d}") == cur.strftime("%Y-%m-%d")
-        if (cur.hour, cur.minute) >= (hh, mm) and not fired:
-            due.append(slot["kind"])
+        kind = slot["kind"]
+        slot_dt = cur.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if slot_dt > cur:
+            continue
+        if (cur - slot_dt).total_seconds() > WINDOW_H * 3600:
+            continue
+        if st.kv_get(_slot_key(hh, mm, day)) == "1":
+            continue
+        if last and last.get(f"{hh:02d}:{mm:02d}") == day:
+            continue
+        due.append((hh, mm, kind))
     return due
-
-
-def _schedule_time_of(kind: str) -> tuple[int, int]:
-    for slot in cfg.schedule:
-        if slot["kind"] == kind:
-            return slot["time"]
-    return 0, 0
 
 
 def scheduler_loop():
@@ -115,21 +113,20 @@ def scheduler_loop():
                 sync()
                 last_sync = time.time()
 
-            due = _schedule_due(last)
-            for kind in due:
-                hh, mm = _schedule_time_of(kind)
+            st = _storage()
+            for hh, mm, kind in _schedule_due(last):
                 key = f"{hh:02d}:{mm:02d}"
+                day = now().strftime("%Y-%m-%d")
                 log.info("Сработал слот %s (%s)", key, kind)
                 try:
-                    POSTERS[kind]()
+                    ok = POSTERS[kind]()
                 except Exception as e:  # noqa
                     log.exception("Ошибка в посте %s: %s", kind, e)
-                last[key] = now().strftime("%Y-%m-%d")
+                    ok = False
+                if ok:
+                    st.kv_set(_slot_key(hh, mm, day), "1")
+                    last[key] = day
                 time.sleep(cfg.post_delay)
-
-            if now().strftime("%H:%M") == "00:00":
-                for k in list(last):
-                    last[k] = ""
 
             time.sleep(20)
         except Exception:  # noqa
@@ -168,10 +165,48 @@ def run_selfcheck() -> int:
     return 0 if not bad else 1
 
 
+def _drop_webhook() -> None:
+    """Сброс вебхука: без него getUpdates не получает сообщения (409 Conflict)."""
+    try:
+        _tg("deleteWebhook", json={"drop_pending_updates": False})
+        info = _tg("getWebhookInfo") or {}
+        if info.get("url"):
+            log.warning("Вебхук всё ещё установлен: %s", info.get("url"))
+        else:
+            log.info("Вебхук сброшен — работаем через getUpdates")
+    except Exception as e:  # noqa
+        log.warning("deleteWebhook: %s", e)
+
+
+def _owner_id() -> int:
+    """Владелец: OWNER_ID из .env либо первый, кто написал боту (kv owner_id)."""
+    if cfg.owner_id:
+        return int(cfg.owner_id)
+    try:
+        return int(_storage().kv_get("owner_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _claim_owner(uid: int, chat: int) -> bool:
+    """Автозахват владельца, если OWNER_ID не задан (первый написавший)."""
+    if cfg.owner_id or _owner_id():
+        return False
+    _storage().kv_set("owner_id", str(int(uid)))
+    log.info("Владелец бота назначен автоматически: %s", uid)
+    _tg("sendMessage", json={
+        "chat_id": chat,
+        "text": (f"👑 Вы назначены владельцем бота (ID {uid}).\n"
+                 "Теперь доступны /status, /check, /post, /sync, /emojis."),
+    })
+    return True
+
+
 def command_handler():
     me = _tg("getMe")
     if me:
         log.info("Бот: @%s", me.get("username"))
+    _drop_webhook()
     offset = 0
     while True:
         try:
@@ -196,11 +231,13 @@ def command_handler():
                 chat = msg["chat"]["id"]
                 text = (msg.get("text") or "").strip()
                 low = text.lower()
+
+                # первый написавший становится владельцем, если OWNER_ID не задан
+                _claim_owner(uid, chat)
+                owner = _owner_id()
                 is_admin_cmd = low.startswith(ADMIN_COMMANDS)
 
-                # ЗАЩИТА: если OWNER_ID не задан явно — админ-команды НЕ выполняем,
-                # иначе любой человек в Telegram мог бы управлять ботом.
-                if is_admin_cmd and (not cfg.owner_id or uid != cfg.owner_id):
+                if is_admin_cmd and uid != owner:
                     _tg("sendMessage", json={
                         "chat_id": chat,
                         "text": ("⚠️ Доступ закрыт. Укажите ваш Telegram ID "
@@ -241,7 +278,7 @@ def command_handler():
 
                 # 3) владелец просто прислал premium-эмодзи — подсказываем слоты
                 ids = _custom_emoji_ids(msg)
-                if ids and cfg.owner_id and uid == cfg.owner_id:
+                if ids and owner and uid == owner:
                     _tg("sendMessage", json={
                         "chat_id": chat,
                         "parse_mode": "HTML",
@@ -263,12 +300,15 @@ HELP_TEXT = (
     "/status — статистика и расписание\n"
     "/check — самодиагностика автономности\n"
     "/sync — обновить каталог скидок\n"
-    "/post single|multi|series|roundup|ending|under300|freebie|releases|event\n"
+    "/post single — пост об одной игре с описанием\n"
+    "/post multi — подборка из 4 игр\n"
+    "/post news — игровая новость дня\n"
     "\n<b>Эмодзи постов</b>\n"
     "/emojis — какие эмодзи стоят в каждом слоте\n"
     "/setemoji fire 🔥 — запомнить эмодзи для слота (можно premium)\n"
     "/resetemojis — вернуть набор по умолчанию\n"
-    "/emoji_id — переслать premium-эмодзи и узнать его emoji-id"
+    "/emoji_id — переслать premium-эмодзи и узнать его emoji-id\n"
+    "\n<b>Расписание</b>: 12:00 подборка · 15:00 игра · 18:00 новость · 21:00 игра"
 )
 
 
@@ -386,6 +426,16 @@ def main():
         raise SystemExit(run_selfcheck())
     if args and args[0] == "--once":
         raise SystemExit(run_once())
+    if args and args[0] == "--listen":
+        # serverless-режим: слушаем личку (команды) N секунд и выходим.
+        # Используется в GitHub Actions между постами по расписанию.
+        secs = int(args[1]) if len(args) > 1 and args[1].isdigit() else 240
+        cfg.ensure_dirs()
+        import threading
+        threading.Thread(target=command_handler, daemon=True).start()
+        log.info("Слушаю личку %d с ...", secs)
+        time.sleep(secs)
+        raise SystemExit(0)
     if args and args[0] == "--force" and len(args) > 1 and args[1] in POSTERS:
         cfg.ensure_dirs()
         raise SystemExit(run_once(force_kind=args[1]))

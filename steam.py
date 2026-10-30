@@ -221,6 +221,14 @@ def fetch_game_details(appid: int, force: bool = False) -> dict:
 
     base = ru or kz or ua or us or {}
     raw_desc = (base.get("short_description") or "").strip()
+    # Описание обязано быть на русском: если Steam отдал английский текст
+    # (у игры нет русской локализации) — переводим через translate_ru().
+    desc_ru = _clean_html(raw_desc)
+    translated = False
+    if desc_ru and _latin_ratio(desc_ru) > 0.35:
+        tr = _clean_html(translate_ru(desc_ru))
+        if tr and len(tr) >= 20 and _latin_ratio(tr) < 0.5:
+            desc_ru, translated = tr, True
     name = base.get("name", str(appid))
     genres = [g.get("description", "") for g in (base.get("genres", []) or []) if g.get("description")]
 
@@ -232,9 +240,10 @@ def fetch_game_details(appid: int, force: bool = False) -> dict:
         "name": name,
         "type": base.get("type", "game"),
         # short_desc — уже переведённое и сжатое (для карточек/фолбэков),
-        # short_desc_raw — как отдал Steam: из него берём ОДНО чистое предложение.
-        "short_desc": process_description(raw_desc, name, genres),
-        "short_desc_raw": _clean_html(raw_desc),
+        # short_desc_raw — русский текст как есть: из него берём 1–2 предложения.
+        "short_desc": process_description(desc_ru, name, genres),
+        "short_desc_raw": desc_ru,
+        "desc_translated": translated,
         "header_image": base.get("header_image", ""),
         "genres": genres,
         "price_ru": price_ru,

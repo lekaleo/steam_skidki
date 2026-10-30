@@ -228,32 +228,58 @@ def _usd(n) -> str:
 # ================================================================ ОПИСАНИЕ
 
 MAX_SENTENCE = 130
+MAX_DESC = 200
 _SENT_END_RE = re.compile(r"[.!?…]+(?=\s|$)")
 _BAD_DESC = ("все права защищены", "©", "all rights reserved", "steam", "valve")
 
 
-def one_sentence(details: dict) -> str:
-    """ОДНО законченное русское предложение описания (или пусто).
+def description(details: dict) -> str:
+    """Русское описание игры: 1–2 ПОЛНЫХ предложения, не длиннее 200 символов.
 
-    Правила: только русский текст (никакого машинного перевода), только
-    первое законченное предложение, не длиннее 130 символов. Иначе — пусто,
-    и в посте останется только строка жанров и локализации.
+    Текст уже переведён на русский в steam.fetch_game_details (translate_ru),
+    поэтому английский тут только как аварийный случай — тогда лучше пусто.
     """
     text = _clean(details.get("short_desc_raw") or "")
     if len(text) < 25:
+        text = _clean(details.get("short_desc") or "")
+    if len(text) < 25:
         return ""
-    if _latin_ratio(text) > 0.35:
+    if _latin_ratio(text) > 0.5:
         return ""
-    m = _SENT_END_RE.search(text)
-    if not m:
+
+    parts: list[str] = []
+    total = 0
+    pos = 0
+    for m in _SENT_END_RE.finditer(text):
+        sent = text[pos:m.end()].strip()
+        pos = m.end()
+        if not sent:
+            continue
+        if total + len(sent) + (1 if parts else 0) > MAX_DESC:
+            break
+        parts.append(sent)
+        total += len(sent) + 1
+        if len(parts) >= 2:
+            break
+
+    if not parts:
+        # одно длинное предложение > 200 — берём сжатый вариант
+        short = _clean(details.get("short_desc") or "")
+        if 25 <= len(short) <= MAX_DESC and _latin_ratio(short) <= 0.5:
+            parts = [short]
+
+    out = " ".join(parts).strip()
+    if len(out) < 20:
         return ""
-    sent = text[: m.end()].strip()
-    if len(sent) < 20 or len(sent) > MAX_SENTENCE:
-        return ""
-    low = sent.lower()
+    low = out.lower()
     if any(b in low for b in _BAD_DESC):
         return ""
-    return _e(sent)
+    return _e(out)
+
+
+def one_sentence(details: dict) -> str:
+    """Обратная совместимость: то же описание (1–2 предложения)."""
+    return description(details)
 
 
 # ================================================================ ЦЕНЫ
@@ -419,7 +445,7 @@ def single_post(game, details: dict, kind: str = "single") -> str:
     if meta:
         L.append(f"<i>{meta}</i>")
 
-    sent = one_sentence(details)
+    sent = description(details)
     if sent:
         L += ["", f"<blockquote>{sent}</blockquote>"]
 
@@ -546,6 +572,60 @@ _EDITION_RE = re.compile(
     r"\s*(\d*))$",
     re.I,
 )
+def news_post(article: dict) -> str:
+    """Игровая новость: заголовок + суть в 2–3 предложения + ссылка на источник."""
+    title = _e(article.get("title") or "Новость игрового мира")
+    summary = _clean(article.get("summary") or "")
+    url = article.get("url") or ""
+    source = _e(article.get("source") or "источник")
+
+    L = [f'{emo("news")} <b>НОВОСТИ ИГР</b>', "", f"<b>{title}</b>"]
+
+    # 2–3 полных предложения, без воды
+    parts: list[str] = []
+    pos = 0
+    total = 0
+    for m in _SENT_END_RE.finditer(summary):
+        sent = summary[pos:m.end()].strip()
+        pos = m.end()
+        if not sent:
+            continue
+        if total + len(sent) + (1 if parts else 0) > 600:
+            break
+        parts.append(sent)
+        total += len(sent) + 1
+        if len(parts) >= 3:
+            break
+    # RSS часто обрубает анонс на полуслове — такое «предложение» выбрасываем,
+    # чтобы в посте были только законченные фразы
+    while len(parts) > 1 and parts[-1].rstrip().endswith(("…", "...")):
+        parts.pop()
+    body = " ".join(parts).strip()
+    if not body and summary:
+        body = summary[:400].rsplit(" ", 1)[0] + "…"
+    if body:
+        L += ["", f"<blockquote>{_e(body)}</blockquote>"]
+
+    if url:
+        L += ["", f'🔗 <a href="{_e(url)}">Читать на {source}</a>']
+
+    L += ["", _cta("Интересно? Поставьте реакцию 👇"), _footer()]
+    text = "\n".join(L)
+    if vlen(text) > cfg.caption_limit:
+        # обрезаем тело новости, но структуру и ссылку сохраняем
+        while parts and vlen(text) > cfg.caption_limit:
+            parts.pop()
+            body = " ".join(parts).strip()
+            L2 = [f'{emo("news")} <b>НОВОСТИ ИГР</b>', "", f"<b>{title}</b>"]
+            if body:
+                L2 += ["", f"<blockquote>{_e(body)}</blockquote>"]
+            if url:
+                L2 += ["", f'🔗 <a href="{_e(url)}">Читать на {source}</a>']
+            L2 += ["", _cta("Интересно? Поставьте реакцию 👇"), _footer()]
+            text = "\n".join(L2)
+    return text
+
+
 _NUM_SUFFIX_RE = re.compile(r"\s+(i{1,3}|iv|v{1,3}|ix|x{1,3}|xl|l|2|3|4|5|6|7|8|9|10|11|12)\s*$", re.I)
 
 

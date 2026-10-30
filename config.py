@@ -12,10 +12,11 @@ def _get(key: str, default: str) -> str:
     return os.getenv(key, default).strip()
 
 
-DEFAULT_SCHEDULE = (
-    "10:00 roundup, 12:00 releases, 13:00 single, 15:00 under300, "
-    "18:00 multi, 20:00 ending, 22:00 single"
-)
+# РОВНО 4 поста в день. Никаких extra-рубрик: только multi / single / news.
+DEFAULT_SCHEDULE = "12:00 multi, 15:00 single, 18:00 news, 21:00 single"
+
+# разрешённые рубрики расписания (всё остальное игнорируется при разборе SCHEDULE)
+SCHEDULE_KINDS = ("multi", "single", "news")
 
 
 @dataclass
@@ -36,9 +37,8 @@ class Config:
     tz_offset: int = int(_get("TIMEZONE_OFFSET", "3"))
     post_delay: float = float(_get("POST_DELAY", "10"))
 
-    # "10:00 roundup, 12:00 releases, 13:00 single, 15:00 under300, 18:00 multi,
-    #  20:00 ending, 22:00 single"
-    # releases — 1 раз в день, чтобы ~85% канала оставалось про скидки.
+    # "12:00 multi, 15:00 single, 18:00 news, 21:00 single"
+    # строго 4 поста в день: подборка, две игры, новость.
     schedule: list = field(default_factory=lambda: _parse_schedule(
         _get("SCHEDULE", DEFAULT_SCHEDULE) or DEFAULT_SCHEDULE))
 
@@ -90,6 +90,7 @@ class Config:
 
 
 def _parse_schedule(raw: str) -> list:
+    """Разбирает SCHEDULE и жёстко отбрасывает всё, кроме multi/single/news."""
     out = []
     for part in raw.split(","):
         part = part.strip()
@@ -98,8 +99,23 @@ def _parse_schedule(raw: str) -> list:
         bits = part.split()
         if len(bits) != 2:
             continue
-        hh, mm = bits[0].split(":")
-        out.append({"time": (int(hh), int(mm)), "kind": bits[1].strip()})
+        try:
+            hh, mm = bits[0].split(":")
+            hh, mm = int(hh), int(mm)
+        except ValueError:
+            continue
+        kind = bits[1].strip().lower()
+        if kind not in SCHEDULE_KINDS:
+            continue
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            continue
+        out.append({"time": (hh, mm), "kind": kind})
+    if not out:
+        # пустой/битый SCHEDULE не должен оставить канал без постов
+        out = [{"time": (12, 0), "kind": "multi"},
+               {"time": (15, 0), "kind": "single"},
+               {"time": (18, 0), "kind": "news"},
+               {"time": (21, 0), "kind": "single"}]
     return sorted(out, key=lambda x: x["time"])
 
 
