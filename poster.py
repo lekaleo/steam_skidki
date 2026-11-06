@@ -24,7 +24,7 @@ import templates
 from config import cfg
 from images import make_card, make_multi_card, make_news_card
 from steam import (compute_score, download_image, fetch_game_details,
-                   search_specials, search_upcoming_and_new)
+                   looks_like_dlc, search_specials, search_upcoming_and_new)
 from storage import Game, Storage
 
 security.install()
@@ -248,6 +248,80 @@ def _pick(games: list[Game], n: int, exclude: set[int] | None = None,
     return out
 
 
+# ---- сбалансированный выбор: и хиты, и нишевые в одном дне ----
+# Владелец просил не зацикливаться на НН-играх: в канал должны попадать
+# и известные тайтлы, и малоизвестные. Делим пул на три яруса по РЕАЛЬНОЙ
+# популярности (число отзывов в Steam) и берём из разных.
+TIER_HIT = 10000    # хиты: >= 10k отзывов
+TIER_MID = 1000     # заметные: 1k..10k
+# меньше 1000 — нишевые
+POPULAR_SHARE = 0.30  # запасной вариант деления, если один ярус пуст
+
+
+def _tier(g: Game) -> int:
+    """0 — хит, 1 — заметная, 2 — нишевая."""
+    rc = int(getattr(g, "review_count", 0) or 0)
+    if rc >= TIER_HIT:
+        return 0
+    if rc >= TIER_MID:
+        return 1
+    return 2
+
+
+def _split_bins(pool: list[Game]) -> tuple[list[Game], list[Game]]:
+    """Делит пул на «популярные» (хиты + заметные) и «остальные» (нишевые).
+
+    Сортировка по score уже задаёт порядок, но популярность считается по
+    отзывам: так в верхнюю корзину попадают именно известные игры, даже
+    если их score чуть ниже.
+    """
+    if len(pool) <= 3:
+        return list(pool), []
+    pop = [g for g in pool if _tier(g) <= 1]
+    niche = [g for g in pool if _tier(g) == 2]
+    if not pop or not niche:
+        # если один из ярусов пуст, делим по score как раньше
+        n_top = max(2, int(len(pool) * POPULAR_SHARE))
+        return list(pool[:n_top]), list(pool[n_top:])
+    return pop, niche
+
+
+def _pick_balanced(games: list[Game], n: int, exclude: set[int] | None = None,
+                   mark: bool = True) -> list[Game]:
+    """Выбирает n игр так, чтобы в подборке были и популярные, и нишевые.
+
+    - n >= 2 (multi): примерно половина из популярных, половина из нишевых;
+    - n == 1 (single): чередуем — сегодня популярная, следующая нишевая.
+    """
+    exclude = exclude or set()
+    st = _storage()
+    pool = [g for g in games
+            if g.appid not in exclude and not st.is_posted(g.appid)
+            and not looks_like_dlc(getattr(g, "title", ""))]
+    pop, niche = _split_bins(pool)
+    random.shuffle(pop)
+    random.shuffle(niche)
+
+    if n >= 2:
+        n_pop = max(1, min((n + 1) // 2, len(pop)))  # ceil(n/2), но не больше пула
+        chosen = (pop[:n_pop] + niche[:n - n_pop])[:n]
+        # если нишевых не хватило — добираем популярными и наоборот
+        if len(chosen) < n:
+            rest = [g for g in (pop + niche) if g not in chosen]
+            chosen += rest[:n - len(chosen)]
+    else:
+        # single: чередуем источник по счётчику (нечётный запуск — популярная)
+        turn = int(st.kv_get("pick_turn") or 0)
+        primary, fallback = (pop, niche) if turn % 2 == 0 else (niche, pop)
+        chosen = (primary[:1] or fallback[:1])
+        st.kv_set("pick_turn", str(turn + 1))
+
+    if mark:
+        for g in chosen:
+            st.mark_skipped(g.appid, "picked")
+    return chosen
+
+
 def _enrich(games: list[Game]) -> dict[int, dict]:
     details = {}
     st = _storage()
@@ -261,6 +335,11 @@ def _enrich(games: list[Game]) -> dict[int, dict]:
         if not d or d.get("type") in SKIP_TYPES:
             # пустой ответ Steam — игру больше не трогаем, иначе она зациклит выбор
             st.mark_skipped(g.appid, "details-empty")
+            continue
+        # DLC/паки приходят иногда как type=game — ловим по названию
+        if looks_like_dlc(d.get("name") or getattr(g, "title", "")):
+            log.info("Похоже на DLC/пак — пропускаю: %s", d.get("name") or g.title)
+            st.mark_skipped(g.appid, "dlc")
             continue
         # обновляем вес игры по свежим данным (только для порядка очереди)
         sc = compute_score(
@@ -526,7 +605,7 @@ def _post_single_impl() -> bool:
     _ensure_candidates(6)
     st = _storage()
     for _ in range(10):
-        cand = _pick(_event_priority(st.candidates(cfg.min_discount, cfg.min_score)), 1)
+        cand = _pick_balanced(_event_priority(st.candidates(cfg.min_discount, cfg.min_score)), 1)
         if not cand:
             log.warning("Кандидаты кончились — single опубликовать нечем")
             return False
@@ -553,7 +632,7 @@ def _post_single_impl() -> bool:
 def _post_multi_impl() -> bool:
     """Подборка РОВНО из 4 игр: мульти-карточка + список с ценами в 4 валютах."""
     _ensure_candidates(8)
-    cands = _pick(_event_priority(_storage().candidates(cfg.min_discount, cfg.min_score)), 4)
+    cands = _pick_balanced(_event_priority(_storage().candidates(cfg.min_discount, cfg.min_score)), 4)
     if len(cands) < 4:
         log.info("Меньше 4 кандидатов — публикуем одиночный пост")
         return _post_single_impl()  # уже внутри POST_LOCK

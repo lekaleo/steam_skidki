@@ -42,7 +42,27 @@ ALLOWED_IMG_HOSTS = (
 )
 MAX_IMG_BYTES = 10 * 1024 * 1024
 
-SKIP_TYPES = {"demo", "music", "video", "series", "mod", "advertising", "hardware", "config"}
+SKIP_TYPES = {"demo", "music", "video", "series", "mod", "advertising", "hardware",
+              "config", "dlc"}
+
+# DLC/soundtrack-паки часто приходят с типом "game" (Steam экономит поля),
+# но по названию видно, что это дополнение, а не самостоятельная игра.
+# В канал такое пускать нельзя: подписчик покупает «игру», а получает пак.
+_DLC_HINTS = (
+    "soundtrack", " - soundtrack", "ost", " - ost",
+    "supporter pack", "supporter upgrade", " - upgrade",
+    " - dlc", "dlc pack", "expansion pass", "season pass",
+    "digital artbook", "artbook", "art book", "artbook",
+    " - cosmetic", "cosmetic pack", " - skin", "skin pack",
+    " - soundtrack edition", "bonus content", " - bonus",
+    "voice props pack", " - car pack", " - vehicle pack",
+)
+
+
+def looks_like_dlc(title: str) -> bool:
+    """Эвристика: название похоже на DLC/пак/саундтрек, а не на игру."""
+    t = (title or "").lower()
+    return any(h in t for h in _DLC_HINTS)
 
 # кэши в памяти процесса
 _st_cache: dict = {}
