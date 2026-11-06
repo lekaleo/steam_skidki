@@ -232,6 +232,11 @@ def handle_message(msg: dict) -> bool:
     user = msg.get("from") or {}
     if user.get("is_bot"):
         return False
+    # Анонимные админы и посты от имени канала приходят без from.id —
+    # такой апдейт модерировать нечем, пропускаем (иначе Telegram вернёт
+    # «Bad Request: invalid user_id specified»).
+    if not user.get("id"):
+        return False
     # админов не трогаем
     member = _api("getChatMember", json={"chat_id": chat_id, "user_id": user.get("id")})
     if member and member.get("status") in ("administrator", "creator"):
