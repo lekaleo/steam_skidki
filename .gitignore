@@ -7,3 +7,8 @@ images/
 raw_*.jpg
 card_*.jpg
 logs/
+*.log
+*.log.*
+*.db-wal
+*.db-shm
+bot.lock

@@ -288,6 +288,26 @@ _AWAIT_LOCK = threading.Lock()
 _AWAIT: dict[int, str] = {}       # chat_id -> "link" | "custom"
 _PENDING: dict[str, dict] = {}    # token -> {"type","data","ts"}
 
+# ---- антифлуд: защита канала от спама командами ----
+# Даже владелец (или тот, кто получил доступ к его телефону) не должен
+# суметь залить канал постами: на тяжёлые действия — пауза.
+HEAVY_COOLDOWN = float(os.environ.get("POST_COOLDOWN", "20") or 20)
+_LAST_HEAVY = 0.0
+_HEAVY_LOCK = threading.Lock()
+_MENU_ONLY_TEXTS = {BTN_STATUS, BTN_EMOJI}
+
+
+def _heavy_allowed() -> float:
+    """0 — можно; иначе сколько секунд осталось ждать (антифлуд)."""
+    global _LAST_HEAVY
+    now = time.time()
+    with _HEAVY_LOCK:
+        left = HEAVY_COOLDOWN - (now - _LAST_HEAVY)
+        if left > 0:
+            return left
+        _LAST_HEAVY = now
+        return 0.0
+
 
 def _menu() -> dict:
     return {"keyboard": MENU_ROWS, "resize_keyboard": True,
@@ -335,6 +355,11 @@ def _thread(fn, *args) -> None:
 
 def _act_kind(chat: int, kind: str) -> None:
     """Пост готовой рубрики: ack сразу, сборка и публикация в фоне."""
+    left = _heavy_allowed()
+    if left:
+        _send(chat, f"🛑 Слишком часто. Подождите {int(left) + 1} с — "
+                    "это защита канала от случайного спама.")
+        return
     _send(chat, _ACK.get(kind, "⏳ Принял команду..."))
 
     def job():
@@ -349,6 +374,10 @@ def _act_link(chat: int, text: str) -> bool:
     m = _STORE_RE.search(text) or _ID_RE.match(text)
     if not m:
         return False
+    left = _heavy_allowed()
+    if left:
+        _send(chat, f"🛑 Слишком часто. Подождите {int(left) + 1} с.")
+        return True
     appid = int(m.group(1))
     _send(chat, f"⏳ Принял, собираю предпросмотр игры <code>{appid}</code>...")
 
@@ -371,14 +400,41 @@ def _act_custom(chat: int) -> None:
                 "Отмена: /cancel")
 
 
+def _act_sync(chat: int) -> None:
+    """Обновление каталога скидок с антифлудом (бьёт по Steam API)."""
+    left = _heavy_allowed()
+    if left:
+        _send(chat, f"🛑 Слишком часто. Подождите {int(left) + 1} с.")
+        return
+    _send(chat, "⏳ Принял, обновляю каталог скидок...")
+
+    def job():
+        try:
+            n = sync()
+            _send(chat, f"✅ Синхронизировано: {n} игр со скидками")
+        except Exception:  # noqa
+            log.exception("sync job failed")
+            _send(chat, "❌ Синхронизация не удалась.")
+    _thread(job)
+
+
 def _act_photo(chat: int, msg: dict) -> None:
     """Фото от владельца -> превью своего поста."""
     photos = msg.get("photo") or []
     if not photos:
         return
+    left = _heavy_allowed()
+    if left:
+        _send(chat, f"🛑 Слишком часто. Подождите {int(left) + 1} с.")
+        return
     with _AWAIT_LOCK:
         _AWAIT.pop(chat, None)
     biggest = max(photos, key=lambda p: int(p.get("file_size") or 0))
+    # Bot API отдаёт файлы до 20 МБ; Telegram и так не пропустит больше,
+    # но проверяем явно, чтобы не тянуть гигантский файл в память.
+    if int(biggest.get("file_size") or 0) > 20 * 1024 * 1024:
+        _send(chat, "❌ Фото слишком большое (максимум 20 МБ).")
+        return
     caption = msg.get("caption") or ""
     _send(chat, "⏳ Принял фото, готовлю превью...")
 
@@ -418,12 +474,21 @@ def _handle_callback(cb: dict) -> None:
     uid = (cb.get("from") or {}).get("id")
 
     action, _, token = data.partition(":")
-    p = _PENDING.pop(token, None)
 
+    # СНАЧАЛА проверяем владельца и только потом трогаем _PENDING:
+    # иначе посторонний, нажав кнопку, мог бы «сжечь» превью владельца.
     if uid != _owner_id():
-        _tg("answerCallbackQuery", json={"callback_query_id": cq,
-                                         "text": "⚠️ Нет доступа", "show_alert": True})
+        # answerCallbackQuery обязателен, иначе у нажавшего крутится спиннер,
+        # но отвечаем один раз в сутки — флуд кнопками не должен генерировать
+        # поток ответов от бота.
+        txt = "⚠️ Нет доступа"
+        if _same_recently(f"cbstranger:{uid}", 86400):
+            txt = ""
+        _tg("answerCallbackQuery", json={"callback_query_id": cq, "text": txt,
+                                         "show_alert": bool(txt)})
         return
+
+    p = _PENDING.pop(token, None)
 
     if action == "can" or not p:
         _tg("answerCallbackQuery", json={"callback_query_id": cq, "text": "Отменено"})
@@ -462,8 +527,13 @@ def _handle_text(chat: int, uid: int, text: str, msg: dict) -> None:
         return
 
     if uid != owner:
-        _send(chat, ("⚠️ Доступ закрыт. Укажите ваш Telegram ID "
-                     f"(<code>{uid}</code>) в переменной OWNER_ID в .env"))
+        # НЕ отвечаем посторонним: иначе флуд в бота превращается во флуд
+        # из бота — тратится лимит Telegram (30 сообщений/с) и CPU.
+        # Человеку, который ошибся адресом, достаточно одного ответа в сутки.
+        if not _same_recently(f"stranger:{uid}", 86400):
+            log.warning("Отклонено сообщение от постороннего ID %s", uid)
+            _send(chat, ("⚠️ Это частный бот. Доступ закрыт.\n"
+                         f"Ваш Telegram ID: <code>{uid}</code>"))
         return
 
     # кнопки меню
@@ -487,17 +557,7 @@ def _handle_text(chat: int, uid: int, text: str, msg: dict) -> None:
         _thread(lambda: _send(chat, _check_reply()))
         return
     if text == BTN_SYNC:
-        _send(chat, "⏳ Принял, обновляю каталог скидок...")
-
-        def job():
-            try:
-                n = sync()
-                _send(chat, f"✅ Синхронизировано: {n} игр со скидками")
-            except Exception:  # noqa
-                log.exception("sync job failed")
-                _send(chat, "❌ Синхронизация не удалась.")
-        _thread(job)
-        return
+        return _act_sync(chat)
     if text == BTN_EMOJI:
         _send(chat, _emojis_reply())
         return
@@ -525,17 +585,7 @@ def _handle_text(chat: int, uid: int, text: str, msg: dict) -> None:
         _thread(lambda: _send(chat, _check_reply()))
         return
     if low == "/sync" or low.startswith("/sync "):
-        _send(chat, "⏳ Принял, обновляю каталог скидок...")
-
-        def job():
-            try:
-                n = sync()
-                _send(chat, f"✅ Синхронизировано: {n} игр со скидками")
-            except Exception:  # noqa
-                log.exception("sync job failed")
-                _send(chat, "❌ Синхронизация не удалась.")
-        _thread(job)
-        return
+        return _act_sync(chat)
     if low.startswith("/emojis"):
         _send(chat, _emojis_reply())
         return
@@ -599,7 +649,8 @@ def process_update(u: dict):
     # 3) фото владельца -> свой пост (даже без команды)
     if msg.get("photo"):
         if uid != _owner_id():
-            _send(chat, "⚠️ Доступ закрыт.")
+            if not _same_recently(f"stranger:{uid}", 86400):
+                log.warning("Отклонено фото от постороннего ID %s", uid)
             return
         return _act_photo(chat, msg)
 
