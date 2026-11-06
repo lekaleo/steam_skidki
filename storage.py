@@ -155,22 +155,39 @@ class Storage:
         return [self._row_to_game(r) for r in rows]
 
     def candidates(self, min_discount: int, min_score: int = 0,
-                   max_age_hours: int = 48) -> list[Game]:
-        """Неопубликованные кандидаты: сначала качественные и популярные, потом всё остальное.
+                   max_age_hours: int = 48,
+                   repost_days: int = 30) -> list[Game]:
+        """Кандидаты на пост: неопубликованные ИЛИ опубликованные давно.
 
         max_age_hours: берём только игры, виденные в Steam за последние N часов.
         Скидки кончаются и цены меняются — игра, пропавшая из выдачи Steam,
         не должна поститься со старой ценой.
+
+        repost_days: игру, вышедшую в канал больше N дней назад, можно
+        показать снова (подписчики меняются, а хиты всегда актуальны).
+        repost_days=0 — не повторять никогда.
         """
-        cutoff = int(time.time()) - int(max_age_hours) * 3600
+        now = int(time.time())
+        cutoff = now - int(max_age_hours) * 3600
+        if repost_days and repost_days > 0:
+            repost_before = now - int(repost_days) * 86400
+            # либо ещё не постили, либо постили давно (и это не служебная пометка)
+            posted_filter = ("(p.appid IS NULL OR "
+                             "(p.posted_at<=? AND p.ptype NOT IN "
+                             "('picked','skipped','details-error','details-empty',"
+                             "'no-desc','dlc')))")
+            params = (min_discount, int(min_score or 0), cutoff, repost_before)
+        else:
+            posted_filter = "p.appid IS NULL"
+            params = (min_discount, int(min_score or 0), cutoff)
         rows = self.conn.execute(
-            """SELECT s.* FROM seen s
-               LEFT JOIN posted p ON p.appid=s.appid
-               WHERE s.discount>=? AND p.appid IS NULL AND COALESCE(s.score,0)>=?
-                 AND s.last_seen>=?
-               ORDER BY COALESCE(s.score,0) DESC, s.discount DESC, s.last_seen DESC
-               LIMIT 50""",
-            (min_discount, int(min_score or 0), cutoff),
+            f"""SELECT s.* FROM seen s
+                LEFT JOIN posted p ON p.appid=s.appid
+                WHERE s.discount>=? AND COALESCE(s.score,0)>=?
+                  AND s.last_seen>=? AND {posted_filter}
+                ORDER BY COALESCE(s.score,0) DESC, s.discount DESC, s.last_seen DESC
+                LIMIT 50""",
+            params,
         ).fetchall()
         return [self._row_to_game(r) for r in rows]
 
@@ -210,8 +227,24 @@ class Storage:
     def posted_count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM posted").fetchone()[0]
 
-    def is_posted(self, appid: int) -> bool:
-        return self.conn.execute("SELECT 1 FROM posted WHERE appid=?", (appid,)).fetchone() is not None
+    def is_posted(self, appid: int, repost_days: int = 0) -> bool:
+        """Публиковалась ли игра. repost_days>0 — «старые» посты не считаются.
+
+        Игру, ушедшую в канал больше repost_days дней назад, можно показать
+        снова: подписчики меняются, а скидка на хит снова актуальна.
+        Служебные пометки (picked/skipped/...) повтором не считаются никогда.
+        """
+        row = self.conn.execute(
+            "SELECT posted_at, ptype FROM posted WHERE appid=?", (appid,)
+        ).fetchone()
+        if not row:
+            return False
+        if not repost_days or repost_days <= 0:
+            return True
+        if (row["ptype"] or "") in ("picked", "skipped", "details-error",
+                                    "details-empty", "no-desc", "dlc"):
+            return True
+        return (int(time.time()) - int(row["posted_at"] or 0)) < repost_days * 86400
 
     def mark_skipped(self, appid: int, reason: str = "skipped"):
         """Помечает игру как обработанную (не публикуя), чтобы бот не брал её снова."""

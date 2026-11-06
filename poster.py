@@ -218,7 +218,7 @@ def sync() -> int:
 def _ensure_candidates(n: int = 3):
     """Быстрая подкачка свежих скидок, если очередь кандидатов пустеет."""
     st = _storage()
-    if len(st.candidates(cfg.min_discount, cfg.min_score)) < n:
+    if len(st.candidates(cfg.min_discount, cfg.min_score, repost_days=cfg.repost_days)) < n:
         log.info("Мало кандидатов — быстрая подкачка скидок")
         sync()
 
@@ -295,8 +295,10 @@ def _pick_balanced(games: list[Game], n: int, exclude: set[int] | None = None,
     """
     exclude = exclude or set()
     st = _storage()
+    # is_posted учитывает repost_days: игра, показанная больше 30 дней назад,
+    # считается «новой» и может попасть в пост снова.
     pool = [g for g in games
-            if g.appid not in exclude and not st.is_posted(g.appid)
+            if g.appid not in exclude and not st.is_posted(g.appid, cfg.repost_days)
             and not looks_like_dlc(getattr(g, "title", ""))]
     pop, niche = _split_bins(pool)
     random.shuffle(pop)
@@ -605,7 +607,8 @@ def _post_single_impl() -> bool:
     _ensure_candidates(6)
     st = _storage()
     for _ in range(10):
-        cand = _pick_balanced(_event_priority(st.candidates(cfg.min_discount, cfg.min_score)), 1)
+        cand = _pick_balanced(_event_priority(st.candidates(
+            cfg.min_discount, cfg.min_score, repost_days=cfg.repost_days)), 1)
         if not cand:
             log.warning("Кандидаты кончились — single опубликовать нечем")
             return False
@@ -632,7 +635,8 @@ def _post_single_impl() -> bool:
 def _post_multi_impl() -> bool:
     """Подборка РОВНО из 4 игр: мульти-карточка + список с ценами в 4 валютах."""
     _ensure_candidates(8)
-    cands = _pick_balanced(_event_priority(_storage().candidates(cfg.min_discount, cfg.min_score)), 4)
+    cands = _pick_balanced(_event_priority(_storage().candidates(
+        cfg.min_discount, cfg.min_score, repost_days=cfg.repost_days)), 4)
     if len(cands) < 4:
         log.info("Меньше 4 кандидатов — публикуем одиночный пост")
         return _post_single_impl()  # уже внутри POST_LOCK
@@ -699,7 +703,8 @@ def post_news() -> bool:
 
 def post_series() -> bool:
     _ensure_candidates(6)
-    cands = _pick(_storage().candidates(cfg.min_discount, cfg.min_score), 30)
+    cands = _pick(_storage().candidates(cfg.min_discount, cfg.min_score,
+                                        repost_days=cfg.repost_days), 30)
     groups = templates.group_franchises(cands) if cands else {}
     if not groups:
         log.info("Нет серий — фолбэк на multi/single")
@@ -726,7 +731,8 @@ def post_roundup() -> bool:
     games = _pick(_event_priority(new), 12) if new else []
     if len(games) < 3:
         log.info("Мало новых за 24ч — берём топ кандидатов")
-        games = _pick(_event_priority(st.candidates(cfg.min_discount, cfg.min_score)), 10)
+        games = _pick(_event_priority(st.candidates(cfg.min_discount, cfg.min_score,
+                                                repost_days=cfg.repost_days)), 10)
     if not games:
         return post_single()
     details = _enrich(games)
@@ -745,7 +751,8 @@ def post_roundup() -> bool:
 def post_ending() -> bool:
     _ensure_candidates(4)
     st = _storage()
-    cands = _pick(st.candidates(cfg.min_discount, cfg.min_score), 24)
+    cands = _pick(st.candidates(cfg.min_discount, cfg.min_score,
+                                repost_days=cfg.repost_days), 24)
     enders = []
     for g in cands[:14]:
         try:
@@ -780,7 +787,8 @@ def post_under300() -> bool:
     """💎 Хиты дешевле 300 ₽ (по цене в рублях / по курсу)."""
     _ensure_candidates(8)
     st = _storage()
-    cands = _pick(st.candidates(cfg.min_discount, cfg.min_score), 40)
+    cands = _pick(st.candidates(cfg.min_discount, cfg.min_score,
+                                repost_days=cfg.repost_days), 40)
     picked, details = [], {}
     for g in cands[:12]:
         if len(picked) >= 4:
@@ -840,7 +848,8 @@ def post_event() -> bool:
         return post_multi() or post_single()
 
     st = _storage()
-    pool = _pick(st.candidates(cfg.min_discount, cfg.min_score), 60)
+    pool = _pick(st.candidates(cfg.min_discount, cfg.min_score,
+                               repost_days=cfg.repost_days), 60)
     if not pool:
         return post_multi() or post_single()
 
