@@ -45,6 +45,8 @@ NO_COMMANDS = os.environ.get("NO_COMMANDS", "0").strip() == "1"
 
 STALE_H = 2.0  # слот, наступивший больше 2 часов назад, помечается пропущенным
 
+_LAST_MSG: dict[str, float] = {}  # дедупликация одинаковых строк лога
+
 
 def now() -> datetime:
     return datetime.now(cfg.tz)
@@ -206,14 +208,27 @@ def run_selfcheck() -> int:
 
 
 def _drop_webhook() -> None:
-    """Сброс вебхука: без него getUpdates не получает сообщения (409 Conflict)."""
+    """Сброс вебхука и расширение подписки на ВСЕ типы апдейтов.
+
+    Важно: deleteWebhook сам по себе не сбрасывает allowed_updates, а
+    getUpdates с чужим allowed_updates сужает поток — например, до одних
+    channel_post, и тогда личка владельца молчит. Поэтому явно снимаем
+    ограничение пустым списком (пустой список = все обновления).
+    """
     try:
         _tg("deleteWebhook", json={"drop_pending_updates": False})
+        # снимаем возможную залипшую подписку (allowed_updates = [] => все типы)
+        try:
+            requests.post(API.format(token=cfg.bot_token, method="getUpdates"),
+                          json={"timeout": 0, "offset": -1, "allowed_updates": []},
+                          timeout=30)
+        except requests.RequestException:
+            pass  # 409 здесь ожидаем, если бот уже держит long-poll
         info = _tg("getWebhookInfo") or {}
         if info.get("url"):
             log.warning("Вебхук всё ещё установлен: %s", info.get("url"))
         else:
-            log.info("Вебхук сброшен — работаем через getUpdates")
+            log.info("Вебхук сброшен, подписка на все типы апдейтов — getUpdates")
     except Exception as e:  # noqa
         log.warning("deleteWebhook: %s", e)
 
@@ -621,12 +636,34 @@ def process_pending_updates_once() -> int:
     return n
 
 
+def _same_recently(text: str, window: float = 120.0) -> bool:
+    """True, если точно такое же сообщение уже писалось в лог недавно.
+
+    Нужно, чтобы длительный сбой Telegram (409 или 5xx) не превращал
+    logs/bot.log в бесконечную ленту одинаковых строк.
+    """
+    key = text[:80]
+    now = time.time()
+    if now - _LAST_MSG.get(key, 0) < window:
+        return True
+    _LAST_MSG[key] = now
+    return False
+
+
 def command_handler():
     """Бесконечный приём апдейтов (long-poll) — только для локального бота."""
     if NO_COMMANDS:
         log.info("NO_COMMANDS=1 — режим публикации без прослушивания апдейтов")
         return
-    me = _tg("getMe")
+    # Telegram может отдавать 502/таймауты — пробуем несколько раз, но
+    # НЕ блокируем запуск: важно, чтобы потоки поднялись как можно раньше.
+    me = None
+    for attempt in range(3):
+        me = _tg("getMe")
+        if me:
+            break
+        log.warning("getMe не сработал (попытка %d/3) — пробую снова", attempt + 1)
+        time.sleep(2)
     if me:
         log.info("Бот: @%s", me.get("username"))
     _drop_webhook()
@@ -645,21 +682,31 @@ def command_handler():
                               json=dict(poll, offset=offset), timeout=60)
             data = r.json()
         except requests.RequestException as e:
-            log.warning("getUpdates: сеть недоступна (%s)", security.mask(str(e)))
             pause = min(pause * 2 or 5, 60)
+            msg = security.mask(str(e))
+            if not _same_recently(msg):
+                log.warning("getUpdates: сеть недоступна (%s) — повтор через %.0f с",
+                            msg, pause)
             continue
 
         if not data.get("ok"):
             err = data.get("error_code")
+            desc = str(data.get("description") or "")
             if err == 409:
                 # Другой процесс держит long-poll (например, облачное окно).
                 # Ждём и пробуем снова — владелец не должен видеть поток ошибок.
                 pause = min(pause * 2 or 10, 60)
-                log.warning("getUpdates 409: апдейты забирает другой экземпляр — "
-                            "повтор через %.0f с", pause)
+                if pause < 30 or not _same_recently(desc):
+                    log.warning("getUpdates 409: апдейты забирает другой экземпляр — "
+                                "повтор через %.0f с", pause)
             else:
-                log.error("getUpdates failed: %s", security.mask(data))
                 pause = min(pause * 2 or 3, 60)
+                # 5xx — сбой на стороне Telegram: это временно, не засоряем лог
+                if err and 500 <= int(err) < 600:
+                    log.warning("Telegram недоступен (%s %s) — повтор через %.0f с",
+                                err, desc, pause)
+                else:
+                    log.error("getUpdates failed: %s", security.mask(data))
             continue
 
         pause = 0.0
@@ -940,21 +987,23 @@ def _start_daemon(secs: int | None = None):
 
 def _notify_owner() -> None:
     """Сообщает владельцу в личку, что бот запущен и слушает команды."""
-    try:
-        r = _tg("sendMessage", json={
-            "chat_id": cfg.owner_id,
-            "text": ("✅ <b>Бот онлайн.</b>\n"
-                     f"Канал: {cfg.channel}\n"
-                     "Кнопки — под полем ввода. Пишите /start для справки."),
-            "parse_mode": "HTML",
-            "reply_markup": json.dumps(_menu(), ensure_ascii=False),
-        })
+    payload = {
+        "text": ("✅ <b>Бот онлайн.</b>\n"
+                 f"Канал: {cfg.channel}\n"
+                 "Кнопки — под полем ввода. Пишите /start для справки."),
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(_menu(), ensure_ascii=False),
+    }
+    for attempt in range(3):
+        r = _tg("sendMessage", json=dict(payload, chat_id=cfg.owner_id))
         if r:
             log.info("Владельцу отправлено уведомление «бот онлайн»")
-        else:
-            log.warning("Не удалось уведомить владельца (OWNER_ID=%s)", cfg.owner_id)
-    except Exception:  # noqa
-        log.exception("Ошибка уведомления владельца")
+            return
+        log.warning("Не удалось уведомить владельца (попытка %d/3) — Telegram "
+                    "может быть временно недоступен", attempt + 1)
+        time.sleep(5)
+    log.warning("Владелец не получил уведомление — проверьте, что он писал боту "
+                "(OWNER_ID=%s)", cfg.owner_id)
 
 
 if __name__ == "__main__":
