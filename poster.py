@@ -97,8 +97,9 @@ def _tg(method: str, **kwargs):
 
 # ---------------- отправка фото с каскадным фолбэком ----------------
 
-def _send_photo_raw(caption: str, photo_path: str, reply_markup: dict | None):
-    data = {"chat_id": cfg.channel, "caption": caption, "parse_mode": "HTML"}
+def _send_photo_raw(caption: str, photo_path: str, reply_markup: dict | None,
+                    chat_id=None):
+    data = {"chat_id": chat_id or cfg.channel, "caption": caption, "parse_mode": "HTML"}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     with open(photo_path, "rb") as f:
@@ -138,7 +139,9 @@ def _replace_tg_emoji(caption: str) -> str:
     return TG_EMOJI_RE.sub("", TG_EMOJI_FULL_RE.sub(lambda m: m.group(1) or "", caption))
 
 
-def send_photo(caption: str, photo_path: str, reply_markup: dict | None = None) -> bool:
+def send_photo(caption: str, photo_path: str, reply_markup: dict | None = None,
+               chat_id=None) -> bool:
+    """Публикует фото с подписью. chat_id=None -> канал из .env."""
     if not cfg.bot_token:
         log.warning("Нет BOT_TOKEN, пост не отправлен")
         return False
@@ -154,14 +157,15 @@ def send_photo(caption: str, photo_path: str, reply_markup: dict | None = None) 
     last_err = ""
     for i, (name, text) in enumerate(variants):
         try:
-            r = _send_photo_raw(text, photo_path, reply_markup)
+            r = _send_photo_raw(text, photo_path, reply_markup, chat_id=chat_id)
             resp = r.json()
         except requests.RequestException as e:
             log.error("sendPhoto request error: %s", _mask(e))
             return False
         if resp.get("ok"):
             msg_id = (resp.get("result") or {}).get("message_id")
-            log.info("Пост в канале: message_id=%s, вариант «%s»", msg_id, name)
+            log.info("Фото отправлено: chat=%s message_id=%s, вариант «%s»",
+                     chat_id or "канал", msg_id, name)
             if i:
                 log.warning("sendPhoto отправлен вариантом «%s» (причина: %s)", name, _mask(last_err))
             return True
@@ -430,6 +434,89 @@ def _post_games(games, ptype, caption, card_path, markup=None, mark=True) -> boo
     if not card_path:
         log.warning("Картинка не собралась для %s", ptype)
     return False
+
+
+# ---------------- ручные посты владельца (пункты 2–3) ----------------
+
+def _game_from_details(appid: int, d: dict) -> Game:
+    pr = d.get("price_ru") or {}
+
+    def _f(key):
+        try:
+            return float(pr.get(key) or 0) or None
+        except (TypeError, ValueError):
+            return None
+
+    return Game(appid=appid,
+                title=d.get("name") or f"AppID {appid}",
+                discount=int(pr.get("discount") or 0),
+                final=_f("final"), initial=_f("initial"), currency="RUB")
+
+
+def build_game_post(appid: int) -> dict | None:
+    """Собирает предпросмотр поста по AppID: карточка + русский текст.
+
+    Ничего не публикует и не помечает игру — сначала владелец смотрит превью
+    в личке и жмёт «Опубликовать».
+    """
+    d = fetch_game_details(appid)
+    if not d:
+        return None
+    game = _game_from_details(appid, d)
+    caption = templates.steam_game_post(game, d)
+    card = _card(game, d, "steam_game", d.get("name") or game.title)
+    if not card:
+        return None
+    return {"appid": appid, "caption": caption, "card": card,
+            "game": game, "details": d}
+
+
+def publish_game_preview(p: dict) -> bool:
+    """Публикует ранее собранное превью игры в канал и закрывает сделку в базе."""
+    g: Game = p["game"]
+    markup = _keyboard([g], {g.appid: p["details"]}, "single")
+    ok = send_photo(p["caption"], p["card"], reply_markup=markup)
+    if ok:
+        _storage().mark_posted([g.appid], "manual")
+        log.info("Ручной пост по игре опубликован: %s", g.title)
+        _cleanup_after_post([g], p["card"])
+    return ok
+
+
+def download_telegram_file(file_id: str) -> str:
+    """Скачивает файл из Telegram (фото владельца) в images/custom_*.jpg."""
+    info = _tg("getFile", json={"file_id": file_id}) or {}
+    path = info.get("file_path")
+    if not path:
+        return ""
+    url = f"https://api.telegram.org/file/bot{cfg.bot_token}/{path}"
+    try:
+        r = requests.get(url, timeout=90)
+    except requests.RequestException as e:
+        log.error("Скачивание файла из Telegram: %s", _mask(e))
+        return ""
+    if r.status_code != 200 or not r.content:
+        log.error("Скачивание файла из Telegram: HTTP %s", r.status_code)
+        return ""
+    out = os.path.join(cfg.img_dir, f"custom_{int(time.time() * 1000)}.jpg")
+    with open(out, "wb") as f:
+        f.write(r.content)
+    return out
+
+
+def build_custom_post(text: str, photo: str) -> dict | None:
+    """Предпросмотр своего поста: фото + текст + подпись канала."""
+    caption = templates.custom_post(text)
+    if not caption:
+        return None
+    return {"caption": caption, "card": photo}
+
+
+def publish_custom_preview(p: dict) -> bool:
+    ok = send_photo(p["caption"], p["card"])
+    if ok:
+        log.info("Свой пост владельца опубликован в канал")
+    return ok
 
 
 # ---------------- форматы ----------------

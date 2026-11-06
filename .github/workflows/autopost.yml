@@ -111,13 +111,21 @@ jobs:
         run: python preview_news.py
 
       # ---------- основное: окно работы бота ----------
+      # NO_COMMANDS=1: облако публикует по расписанию, но НЕ держит getUpdates —
+      # иначе локальный бот и облако отбирали бы апдейты друг у друга (409),
+      # и владелец не получал бы мгновенных ответов.
       - name: Бот работает (окно ~3 часа)
         if: env.MODE == 'auto'
         run: timeout --signal=INT 11350 python run_bot.py --serve 11200 || true
+        env:
+          NO_COMMANDS: "1"
+          POST_SCHEDULE: "1"
 
       - name: Проба цепочки (2 минуты)
         if: env.MODE == 'probe'
         run: timeout --signal=INT 200 python run_bot.py --serve 120 || true
+        env:
+          NO_COMMANDS: "1"
 
       # ---------- сохранить историю ----------
       - name: Save state.db to actions/cache (резерв)

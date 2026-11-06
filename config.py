@@ -45,6 +45,11 @@ class Config:
     # синхронизация каждые 4 часа = 6 раз в сутки
     sync_hours: int = int(_get("SYNC_HOURS", "4"))
 
+    # POST_SCHEDULE=0 — процесс только отвечает на команды и делает ручные
+    # посты, а расписание публикует облачный workflow (иначе два процесса
+    # постили бы по одному и тому же слоту дважды).
+    post_schedule: bool = _get("POST_SCHEDULE", "1").strip() in ("1", "true", "True", "yes", "on")
+
     # премиум-эмодзи Telegram (можно выключить, если у бота нет прав)
     premium_emoji: bool = _get("PREMIUM_EMOJI", "1") in ("1", "true", "True", "yes")
     # свои проверенные emoji-id: "fire=5368324170671202286,bolt=5456140674028019486"
@@ -57,6 +62,7 @@ class Config:
 
     data_dir: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
     img_dir: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "images"))
+    logs_dir: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "logs"))
     db_path: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "data", "state.db"))
     assets_dir: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets"))
 
@@ -75,6 +81,7 @@ class Config:
     def ensure_dirs(self):
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.img_dir, exist_ok=True)
+        os.makedirs(self.logs_dir, exist_ok=True)
         os.makedirs(os.path.join(self.assets_dir, "fonts"), exist_ok=True)
 
     def mask(self, text) -> str:
@@ -89,8 +96,27 @@ class Config:
         return f"🔵 {self.channel_title} — подписаться"
 
 
+# устаревшие рубрики: если они остались в SCHEDULE — расписание считаем битым
+LEGACY_KINDS = ("roundup", "series", "ending", "under300", "releases",
+                "freebie", "event", "upcoming")
+
+
+def _default_schedule() -> list:
+    """Эталон: ровно 4 поста в день."""
+    return [{"time": (12, 0), "kind": "multi"},
+            {"time": (15, 0), "kind": "single"},
+            {"time": (18, 0), "kind": "news"},
+            {"time": (21, 0), "kind": "single"}]
+
+
 def _parse_schedule(raw: str) -> list:
-    """Разбирает SCHEDULE и жёстко отбрасывает всё, кроме multi/single/news."""
+    """Разбирает SCHEDULE. Любое отклонение от эталона -> эталонные 4 слота.
+
+    Старая строка в .env (roundup/series/ending/under300/releases) раньше
+    просто отфильтровывалась, из-за чего молча терялись слоты (например,
+    news) и в сутках оставалось 2–3 поста. Теперь это считается битым
+    конфигом и жёстко заменяется на дефолтные 4 слота.
+    """
     out = []
     for part in raw.split(","):
         part = part.strip()
@@ -98,24 +124,28 @@ def _parse_schedule(raw: str) -> list:
             continue
         bits = part.split()
         if len(bits) != 2:
-            continue
+            return _default_schedule()
         try:
-            hh, mm = bits[0].split(":")
-            hh, mm = int(hh), int(mm)
+            hh_s, mm_s = bits[0].split(":")
+            hh, mm = int(hh_s), int(mm_s)
         except ValueError:
-            continue
+            return _default_schedule()
         kind = bits[1].strip().lower()
+        if kind in LEGACY_KINDS and kind not in SCHEDULE_KINDS:
+            # устаревшая рубрика в конфиге — перезаписываем расписание целиком
+            return _default_schedule()
         if kind not in SCHEDULE_KINDS:
-            continue
+            return _default_schedule()
         if not (0 <= hh <= 23 and 0 <= mm <= 59):
-            continue
+            return _default_schedule()
         out.append({"time": (hh, mm), "kind": kind})
-    if not out:
-        # пустой/битый SCHEDULE не должен оставить канал без постов
-        out = [{"time": (12, 0), "kind": "multi"},
-               {"time": (15, 0), "kind": "single"},
-               {"time": (18, 0), "kind": "news"},
-               {"time": (21, 0), "kind": "single"}]
+
+    # валидных слотов должно быть ровно 4, иначе день останется без постов
+    if len(out) != 4:
+        return _default_schedule()
+    # два поста не могут стоять в одно и то же время
+    if len({s["time"] for s in out}) != len(out):
+        return _default_schedule()
     return sorted(out, key=lambda x: x["time"])
 
 

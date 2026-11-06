@@ -1,14 +1,20 @@
 services:
-  steam-bot:
+  bot:
     build: .
-    container_name: steam_skidki_bot
-    restart: unless-stopped
+    container_name: steam-skidki-bot
+    restart: unless-stopped        # перезапуск при крэше и после перезагрузки сервера
     env_file:
-      - .env
+      - .env                        # BOT_TOKEN, CHANNEL, OWNER_ID, SCHEDULE
     environment:
-      - TZ=Europe/Moscow
+      POST_SCHEDULE: "1"            # этот процесс публикует по расписанию и слушает команды
+      NO_COMMANDS: "0"
+      TZ: Europe/Moscow
     volumes:
-      # база скидок и статистика сохраняются между перезапусками
-      - ./data:/app/data
+      - ./data:/app/data            # state.db (posted, seen, эмодзи, слоты)
       - ./images:/app/images
-      - ./assets:/app/assets
+      - ./logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

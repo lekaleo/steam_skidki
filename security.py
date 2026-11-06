@@ -41,3 +41,10 @@ def install():
     for h in root.handlers:
         h.addFilter(f)
     _installed = True
+
+
+def mask(text) -> str:
+    """Возвращает строку с вырезанным токеном — безопасно писать в лог/чат."""
+    s = str(text)
+    token = cfg.bot_token
+    return s.replace(token, "***TOKEN***") if token else s

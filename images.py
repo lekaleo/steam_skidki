@@ -32,6 +32,8 @@ REGION_NAME = {"RUB": "Россия", "KZT": "Казахстан", "UAH": "Ук�
 CUR_SYM = {"RUB": "₽", "KZT": "₸", "UAH": "₴", "USD": "$", "EUR": "€"}
 KIND_LABEL = {
     "single": "СКИДКА В STEAM",
+    # ручной пост по ссылке/AppID: игра может быть без скидки
+    "steam_game": "ИГРА В STEAM",
     "multi": "ВЫГОДНАЯ ПОДБОРКА",
     "series": "СКИДКА НА СЕРИЮ",
     "roundup": "ПОДБОРКА ДНЯ",
@@ -279,8 +281,9 @@ def make_card(header_path, out_path, handle, discount, prices=None, title="",
     for ln in lines:
         c.text((rx, ty), ln, "nbold", 46, WHITE)
         ty += 58
-    c.text((rx, ty + 20), "Выгода", "nreg", 24, MUTED2)
-    c.text((rx + 108, ty + 10), f"−{discount}%", "black", 40, GREEN)
+    if discount > 0:
+        c.text((rx, ty + 20), "Выгода", "nreg", 24, MUTED2)
+        c.text((rx + 108, ty + 10), f"−{discount}%", "black", 40, GREEN)
 
     # доллар США — четвёртая валюта на карточке
     usd = prices.get("USD") or {}
@@ -292,7 +295,8 @@ def make_card(header_path, out_path, handle, discount, prices=None, title="",
         else:
             c.text((rx, ty + 62), usd_txt, "semi", 24, MUTED)
 
-    # бейдж скидки (русские подписи)
+    # бейдж скидки (русские подписи). Без скидки бейдж не рисуем вообще —
+    # иначе на карточке появилось бы бессмысленное «−0%».
     bd = "ХИТ СКИДКА" if discount >= 70 else "СКИДКА"
     bx0, by0, bx1, by1 = 440, 262, 596, 386
     if discount >= 70:
@@ -300,14 +304,15 @@ def make_card(header_path, out_path, handle, discount, prices=None, title="",
                           [bx0, by0, bx1, by1], 16)
         c.rrect([bx0, by0, bx1, by1], 16, outline=(255, 220, 120, 200), width=2)
         bcol = (255, 236, 170)
-    else:
+    elif discount > 0:
         _paste_grad_round(c, _vgrad(bx1 - bx0, by1 - by0, (164, 208, 7, 255), (110, 150, 10, 255)),
                           [bx0, by0, bx1, by1], 16)
         c.rrect([bx0, by0, bx1, by1], 16, outline=(210, 240, 130, 180), width=2)
         bcol = WHITE
-    cx = (bx0 + bx1) / 2
-    c.text((cx, by0 + 40), f"−{discount}%", "black", 40, bcol, anchor="ma")
-    c.text((cx, by1 - 30), bd, "bold", 17, bcol, anchor="ma")
+    if discount > 0:
+        cx = (bx0 + bx1) / 2
+        c.text((cx, by0 + 40), f"−{discount}%", "black", 40, bcol, anchor="ma")
+        c.text((cx, by1 - 30), bd, "bold", 17, bcol, anchor="ma")
 
     # цены
     c.text((56, 436), "ЦЕНЫ В РЕГИОНАХ", "semi", 21, MUTED)

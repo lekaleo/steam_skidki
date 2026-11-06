@@ -473,6 +473,56 @@ def single_post(game, details: dict, kind: str = "single") -> str:
     return "\n".join(L)
 
 
+def steam_game_post(game, details: dict) -> str:
+    """Пост по конкретной игре из Steam (ручной, по ссылке/AppID).
+
+    Отличается от single_post тем, что игра может быть БЕЗ скидки:
+    тогда не выводим «-0%» и дату окончания акции.
+    """
+    name = _e(details.get("name") or getattr(game, "title", ""))
+    url = details.get("store_url") or f"https://store.steampowered.com/app/{game.appid}/"
+    disc = int(getattr(game, "discount", 0) or 0)
+
+    head = f'{emo("fire")} <b><a href="{url}">{name}</a></b>'
+    if disc > 0:
+        head += f"  <code>-{disc}%</code>"
+    L = [head]
+
+    meta = _meta_line(details)
+    if meta:
+        L.append(f"<i>{meta}</i>")
+
+    sent = description(details)
+    if sent:
+        L += ["", f"<blockquote>{sent}</blockquote>"]
+
+    prices = price_lines(details)
+    if prices:
+        L += ["", *prices]
+
+    if disc > 0:
+        exp = _fmt_exp(details.get("exp_date"))
+        if exp:
+            L += ["", f'{emo("clock")} <i>До {exp}</i>']
+
+    L += ["", _cta(), _footer()]
+    return "\n".join(L)
+
+
+def custom_post(text: str) -> str:
+    """Свой пост владельца: текст как есть (экранированный) + подпись канала."""
+    body = html.escape((text or "").strip(), quote=False)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    if not body:
+        return ""
+    out = f"{body}\n\n{_footer()}"
+    if vlen(out) > cfg.caption_limit:
+        room = max(0, cfg.caption_limit - vlen(_footer()) - 4)
+        body = body[:room].rsplit(" ", 1)[0] + "…"
+        out = f"{body}\n\n{_footer()}"
+    return out
+
+
 def multi_post(games: list, details_map: dict, title: str = "ВЫГОДНАЯ ПОДБОРКА",
                kind: str = "multi") -> tuple[str, int]:
     games = sorted(games, key=lambda x: -x.discount)

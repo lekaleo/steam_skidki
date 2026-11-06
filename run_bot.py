@@ -11,16 +11,25 @@
   python run_bot.py --selfcheck — самодиагностика автономности (код возврата 1 при ошибках).
 """
 import html
+import json
 import logging
+import os
+import re
+import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+
+import requests
 
 import security
 import templates
 from config import cfg
-from poster import POSTERS, sync, _storage, _tg, cleanup_images
+from poster import (API, POSTERS, sync, _storage, _tg, cleanup_images,
+                    build_custom_post, build_game_post, download_telegram_file,
+                    publish_custom_preview, publish_game_preview, send_photo)
 import moderator
 
 security.install()
@@ -28,6 +37,11 @@ security.install()
 log = logging.getLogger("bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 security.install()  # повесить фильтр и на хендлеры basicConfig
+
+# Облачный режим (GitHub Actions) публикует посты, но НЕ слушает getUpdates —
+# иначе локальный бот и облако будут отбирать друг у друга апдейты (409)
+# и владелец перестанет получать мгновенные ответы.
+NO_COMMANDS = os.environ.get("NO_COMMANDS", "0").strip() == "1"
 
 STALE_H = 2.0  # слот, наступивший больше 2 часов назад, помечается пропущенным
 
@@ -228,8 +242,328 @@ def _claim_owner(uid: int, chat: int) -> bool:
     return True
 
 
+# ---------------- меню с кнопками (пункт 2) ----------------
+BTN_SINGLE = "🎯 Пост: 1 игра"
+BTN_MULTI = "📦 Пост: 4 игры"
+BTN_NEWS = "📰 Пост: Новость"
+BTN_LINK = "🎮 Пост по ссылке/ID"
+BTN_CUSTOM = "✍️ Свой пост в канал"
+BTN_STATUS = "📊 Статус и проверка"
+BTN_EMOJI = "🎨 Настроить эмодзи"
+BTN_SYNC = "🔄 Обновить скидки"
+
+MENU_ROWS = [
+    [BTN_SINGLE, BTN_MULTI],
+    [BTN_NEWS, BTN_LINK],
+    [BTN_CUSTOM, BTN_STATUS],
+    [BTN_EMOJI, BTN_SYNC],
+]
+MENU_TEXTS = {b for row in MENU_ROWS for b in row}
+
+_ACK = {
+    "single": "⏳ Принял, собираю пост об одной игре...",
+    "multi": "⏳ Принял, собираю подборку из 4 игр...",
+    "news": "⏳ Принял, беру свежую игровую новость...",
+}
+
+_STORE_RE = re.compile(r"store\.steampowered\.com/(?:app|sub)/(\d+)", re.I)
+_ID_RE = re.compile(r"^\s*(\d{3,9})\s*$")
+
+_AWAIT_LOCK = threading.Lock()
+_AWAIT: dict[int, str] = {}       # chat_id -> "link" | "custom"
+_PENDING: dict[str, dict] = {}    # token -> {"type","data","ts"}
+
+
+def _menu() -> dict:
+    return {"keyboard": MENU_ROWS, "resize_keyboard": True,
+            "is_persistent": True, "one_time_keyboard": False}
+
+
+def _send(chat: int, text: str, markup: dict | None = None, menu: bool = True) -> None:
+    """Ответ владельцу. Клавиатура-меню всегда на месте (кроме inline-кнопок)."""
+    data = {"chat_id": chat, "text": text, "parse_mode": "HTML",
+            "disable_web_page_preview": True}
+    if markup is not None:
+        data["reply_markup"] = json.dumps(markup, ensure_ascii=False)
+    elif menu:
+        data["reply_markup"] = json.dumps(_menu(), ensure_ascii=False)
+    _tg("sendMessage", json=data)
+
+
+def _send_preview(chat: int, payload: dict, kind: str) -> None:
+    """Превью поста в личку с кнопками «Опубликовать / Отмена»."""
+    token = os.urandom(6).hex()
+    _PENDING[token] = {"type": kind, "data": payload, "ts": time.time()}
+    # чистим протухшие превью (сутки)
+    for t, p in list(_PENDING.items()):
+        if time.time() - p["ts"] > 86400:
+            _PENDING.pop(t, None)
+    markup = {"inline_keyboard": [[
+        {"text": "🚀 Опубликовать в канал", "callback_data": f"pub:{token}"},
+        {"text": "❌ Отмена", "callback_data": f"can:{token}"},
+    ]]}
+    if not send_photo(payload["caption"], payload["card"],
+                      reply_markup=markup, chat_id=chat):
+        _send(chat, "❌ Не удалось отправить превью — смотрите logs/bot.log")
+
+
+def _thread(fn, *args) -> None:
+    def run():
+        try:
+            fn(*args)
+        except Exception:  # noqa
+            log.exception("Фоновая задача упала: %s", getattr(fn, "__name__", fn))
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ---------------- действия кнопок ----------------
+
+def _act_kind(chat: int, kind: str) -> None:
+    """Пост готовой рубрики: ack сразу, сборка и публикация в фоне."""
+    _send(chat, _ACK.get(kind, "⏳ Принял команду..."))
+
+    def job():
+        ok = POSTERS[kind]()
+        _send(chat, (f"✅ Пост «{kind}» опубликован в {cfg.channel}."
+                     if ok else "❌ Не получилось: нет подходящих игр или новостей."))
+    _thread(job)
+
+
+def _act_link(chat: int, text: str) -> bool:
+    """Пост по ссылке на Steam или по AppID. True — сообщение было ссылкой."""
+    m = _STORE_RE.search(text) or _ID_RE.match(text)
+    if not m:
+        return False
+    appid = int(m.group(1))
+    _send(chat, f"⏳ Принял, собираю предпросмотр игры <code>{appid}</code>...")
+
+    def job():
+        p = build_game_post(appid)
+        if not p:
+            _send(chat, ("❌ Не нашёл игру. Проверьте ссылку: должно быть "
+                         "<code>store.steampowered.com/app/1091500</code> "
+                         "или просто <code>1091500</code>."))
+            return
+        _send_preview(chat, p, "game")
+    _thread(job)
+    return True
+
+
+def _act_custom(chat: int) -> None:
+    with _AWAIT_LOCK:
+        _AWAIT[chat] = "custom"
+    _send(chat, "✍️ Пришлите фото (можно с подписью) — покажу превью. "
+                "Отмена: /cancel")
+
+
+def _act_photo(chat: int, msg: dict) -> None:
+    """Фото от владельца -> превью своего поста."""
+    photos = msg.get("photo") or []
+    if not photos:
+        return
+    with _AWAIT_LOCK:
+        _AWAIT.pop(chat, None)
+    biggest = max(photos, key=lambda p: int(p.get("file_size") or 0))
+    caption = msg.get("caption") or ""
+    _send(chat, "⏳ Принял фото, готовлю превью...")
+
+    def job():
+        path = download_telegram_file(biggest["file_id"])
+        if not path:
+            _send(chat, "❌ Не удалось скачать фото из Telegram.")
+            return
+        p = build_custom_post(caption, path)
+        if not p:
+            _send(chat, "❌ Пустой текст. Пришлите фото с подписью.")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return
+        _send_preview(chat, p, "custom")
+    _thread(job)
+
+
+def _clear_buttons(chat: int, message_id: int, text: str = "") -> None:
+    if not (chat and message_id):
+        return
+    payload = {"chat_id": chat, "message_id": message_id,
+               "reply_markup": json.dumps({"inline_keyboard": []})}
+    _tg("editMessageReplyMarkup", json=payload)
+    if text:
+        _send(chat, text)
+
+
+def _handle_callback(cb: dict) -> None:
+    data = cb.get("data") or ""
+    cq = cb.get("id")
+    msg = cb.get("message") or {}
+    chat = (msg.get("chat") or {}).get("id")
+    mid = msg.get("message_id")
+    uid = (cb.get("from") or {}).get("id")
+
+    action, _, token = data.partition(":")
+    p = _PENDING.pop(token, None)
+
+    if uid != _owner_id():
+        _tg("answerCallbackQuery", json={"callback_query_id": cq,
+                                         "text": "⚠️ Нет доступа", "show_alert": True})
+        return
+
+    if action == "can" or not p:
+        _tg("answerCallbackQuery", json={"callback_query_id": cq, "text": "Отменено"})
+        if p:
+            card = p["data"].get("card")
+            if card and os.path.exists(card):
+                try:
+                    os.remove(card)
+                except OSError:
+                    pass
+        _clear_buttons(chat, mid, "❌ Публикация отменена.")
+        return
+
+    _tg("answerCallbackQuery", json={"callback_query_id": cq,
+                                     "text": "🚀 Публикую в канал..."})
+
+    def job():
+        if p["type"] == "game":
+            ok = publish_game_preview(p["data"])
+        else:
+            ok = publish_custom_preview(p["data"])
+        _clear_buttons(chat, mid,
+                       f"✅ Опубликовано в {cfg.channel}." if ok
+                       else "❌ Не удалось опубликовать — смотрите logs/bot.log")
+    _thread(job)
+
+
+def _handle_text(chat: int, uid: int, text: str, msg: dict) -> None:
+    low = text.lower()
+    owner = _owner_id()
+
+    if low in ("/cancel", "отмена"):
+        with _AWAIT_LOCK:
+            _AWAIT.pop(chat, None)
+        _send(chat, "Ок, отменил ожидание ввода.")
+        return
+
+    if uid != owner:
+        _send(chat, ("⚠️ Доступ закрыт. Укажите ваш Telegram ID "
+                     f"(<code>{uid}</code>) в переменной OWNER_ID в .env"))
+        return
+
+    # кнопки меню
+    if text == BTN_SINGLE:
+        return _act_kind(chat, "single")
+    if text == BTN_MULTI:
+        return _act_kind(chat, "multi")
+    if text == BTN_NEWS:
+        return _act_kind(chat, "news")
+    if text == BTN_LINK:
+        with _AWAIT_LOCK:
+            _AWAIT[chat] = "link"
+        _send(chat, "🎮 Пришлите ссылку на игру в Steam или её AppID:\n"
+                    "<code>https://store.steampowered.com/app/1091500</code>\n"
+                    "<code>1091500</code>")
+        return
+    if text == BTN_CUSTOM:
+        return _act_custom(chat)
+    if text == BTN_STATUS:
+        _send(chat, _status())
+        _thread(lambda: _send(chat, _check_reply()))
+        return
+    if text == BTN_SYNC:
+        _send(chat, "⏳ Принял, обновляю каталог скидок...")
+
+        def job():
+            try:
+                n = sync()
+                _send(chat, f"✅ Синхронизировано: {n} игр со скидками")
+            except Exception:  # noqa
+                log.exception("sync job failed")
+                _send(chat, "❌ Синхронизация не удалась.")
+        _thread(job)
+        return
+    if text == BTN_EMOJI:
+        _send(chat, _emojis_reply())
+        return
+
+    # ожидание ссылки
+    with _AWAIT_LOCK:
+        awaiting = _AWAIT.get(chat)
+    if awaiting == "link":
+        with _AWAIT_LOCK:
+            _AWAIT.pop(chat, None)
+        if _act_link(chat, text):
+            return
+        _send(chat, "❌ Это не похоже на ссылку Steam или AppID.")
+
+    # сама по себе ссылка/ID тоже работает
+    if _act_link(chat, text):
+        return
+
+    # команды
+    if low.startswith("/status"):
+        _send(chat, _status())
+        return
+    if low.startswith("/check"):
+        _send(chat, "⏳ Запускаю самодиагностику...")
+        _thread(lambda: _send(chat, _check_reply()))
+        return
+    if low == "/sync" or low.startswith("/sync "):
+        _send(chat, "⏳ Принял, обновляю каталог скидок...")
+
+        def job():
+            try:
+                n = sync()
+                _send(chat, f"✅ Синхронизировано: {n} игр со скидками")
+            except Exception:  # noqa
+                log.exception("sync job failed")
+                _send(chat, "❌ Синхронизация не удалась.")
+        _thread(job)
+        return
+    if low.startswith("/emojis"):
+        _send(chat, _emojis_reply())
+        return
+    if low.startswith("/setemoji"):
+        _send(chat, _set_emoji_cmd(msg, text))
+        return
+    if low.startswith("/resetemojis"):
+        n = templates.reset_emojis()
+        _send(chat, f"✅ Сброшено слотов: {n}. Вернулся набор по умолчанию.")
+        return
+    if low.startswith("/emoji"):
+        _send(chat, _emoji_ids(msg))
+        return
+    if low.startswith("/post"):
+        parts = low.split()
+        kind = parts[1] if len(parts) > 1 else "single"
+        if kind not in POSTERS:
+            _send(chat, "Форматы: single | multi | news")
+            return
+        return _act_kind(chat, kind)
+    if low.startswith(("/start", "/help")):
+        _send(chat, HELP_TEXT)
+        return
+
+    # premium-эмодзи владельца
+    ids = _custom_emoji_ids(msg)
+    if ids:
+        _send(chat, ("✨ Поймал premium-эмодзи.\nСохраните его в слот:\n"
+                     "<code>/setemoji fire </code>" + text[:8] +
+                     "\n\nСлоты: " + ", ".join(templates.EMOJI_SLOTS)))
+        return
+
+    # любое другое сообщение -> меню + подсказка
+    _send(chat, "Выберите действие кнопками ниже 👇\n\n" + HELP_TEXT)
+
+
 def process_update(u: dict):
-    """Обрабатывает один апдейт Telegram (команды в личке + модерация групп)."""
+    """Обрабатывает один апдейт Telegram (кнопки, команды, посты, модерация)."""
+    cb = u.get("callback_query")
+    if cb:
+        _handle_callback(cb)
+        return
+
     msg = u.get("message") or u.get("edited_message")
     if not msg:
         return
@@ -243,93 +577,21 @@ def process_update(u: dict):
         return
     uid = msg["from"]["id"]
     chat = msg["chat"]["id"]
-    text = (msg.get("text") or "").strip()
-    low = text.lower()
 
     # первый написавший становится владельцем, если OWNER_ID не задан
     _claim_owner(uid, chat)
-    owner = _owner_id()
-    is_admin_cmd = low.startswith(ADMIN_COMMANDS)
 
-    if is_admin_cmd and uid != owner:
-        _tg("sendMessage", json={
-            "chat_id": chat,
-            "text": ("⚠️ Доступ закрыт. Укажите ваш Telegram ID "
-                     f"({uid}) в переменной OWNER_ID в файле .env"),
-        })
-        return
-
-    if low.startswith("/status"):
-        reply = _status()
-    elif low.startswith("/check"):
-        reply = _check_reply()
-    elif low == "/sync":
-        # мгновенный ack, тяжёлая работа — в отдельном потоке
-        _tg("sendMessage", json={"chat_id": chat,
-                                 "text": "⏳ Принял команду, обновляю каталог скидок..."})
-
-        def _sync_job(c: int = chat):
-            try:
-                n = sync()
-                _tg("sendMessage", json={"chat_id": c,
-                                         "text": f"✅ Синхронизировано: {n} игр со скидками"})
-            except Exception:  # noqa
-                log.exception("sync job failed")
-        threading.Thread(target=_sync_job, daemon=True).start()
-        return
-    elif low.startswith("/emojis"):
-        reply = _emojis_reply()
-    elif low.startswith("/setemoji"):
-        reply = _set_emoji_cmd(msg, text)
-    elif low.startswith("/resetemojis"):
-        n = templates.reset_emojis()
-        reply = f"✅ Сброшено слотов: {n}. Вернулся стильный набор по умолчанию."
-    elif low.startswith("/emoji"):
-        reply = _emoji_ids(msg)
-    elif low.startswith("/post"):
-        parts = low.split()
-        kind = parts[1] if len(parts) > 1 else "single"
-        if kind not in POSTERS:
-            reply = "Форматы: " + " | ".join(POSTERS)
-        else:
-            # мгновенный ack (за доли секунды), генерация — в отдельном потоке,
-            # чтобы бот никогда не зависал на долгой сборке поста
-            _tg("sendMessage", json={"chat_id": chat,
-                                     "text": "⏳ Принял команду, собираю пост..."})
-
-            def _post_job(k: str = kind, c: int = chat):
-                try:
-                    ok = POSTERS[k]()
-                except Exception:  # noqa
-                    log.exception("ручной пост %s failed", k)
-                    ok = False
-                _tg("sendMessage", json={
-                    "chat_id": c,
-                    "text": (f"✅ Пост {k} опубликован" if ok
-                             else "❌ Не получилось (нет кандидатов?)"),
-                })
-            threading.Thread(target=_post_job, daemon=True).start()
+    # 3) фото владельца -> свой пост (даже без команды)
+    if msg.get("photo"):
+        if uid != _owner_id():
+            _send(chat, "⚠️ Доступ закрыт.")
             return
-    elif low.startswith(("/start", "/help")):
-        reply = HELP_TEXT
-    else:
-        reply = None
+        return _act_photo(chat, msg)
 
-    if reply and chat:
-        _tg("sendMessage", json={"chat_id": chat, "text": reply, "parse_mode": "HTML"})
+    text = (msg.get("text") or "").strip()
+    if not text:
         return
-
-    # 3) владелец просто прислал premium-эмодзи — подсказываем слоты
-    ids = _custom_emoji_ids(msg)
-    if ids and owner and uid == owner:
-        _tg("sendMessage", json={
-            "chat_id": chat,
-            "parse_mode": "HTML",
-            "text": ("✨ Поймал premium-эмодзи.\n"
-                     "Сохраните его в слот:\n"
-                     "<code>/setemoji fire </code>" + msg.get("text", "")[:8] +
-                     "\n\nСлоты: " + ", ".join(templates.EMOJI_SLOTS)),
-        })
+    _handle_text(chat, uid, text, msg)
 
 
 def process_pending_updates_once() -> int:
@@ -339,6 +601,9 @@ def process_pending_updates_once() -> int:
     комментарии. Offset хранится в SQLite, поэтому апдейты не теряются и
     не обрабатываются дважды между запусками.
     """
+    if NO_COMMANDS:
+        log.info("NO_COMMANDS=1 — апдейты не забираю (слушает локальный бот)")
+        return 0
     _drop_webhook()
     st = _storage()
     offset = int(st.kv_get("tg_offset") or 0)
@@ -357,38 +622,77 @@ def process_pending_updates_once() -> int:
 
 
 def command_handler():
+    """Бесконечный приём апдейтов (long-poll) — только для локального бота."""
+    if NO_COMMANDS:
+        log.info("NO_COMMANDS=1 — режим публикации без прослушивания апдейтов")
+        return
     me = _tg("getMe")
     if me:
         log.info("Бот: @%s", me.get("username"))
     _drop_webhook()
     st = _storage()
     offset = int(st.kv_get("tg_offset") or 0)
+    poll = {"timeout": 15}
+    # Пауза между попытками. Растёт при ошибках (в т.ч. 409 Conflict),
+    # но мгновенно сбрасывается, как только апдейты снова приходят.
+    # Так бот не «долбит» Telegram, если рядом поднялся второй экземпляр.
+    pause = 0.0
     while True:
+        if pause:
+            time.sleep(pause)
         try:
-            updates = _tg("getUpdates", json={"offset": offset, "timeout": 25})
-            if not updates:
-                time.sleep(2)
-                continue
-            for u in updates:
-                offset = u["update_id"] + 1
+            r = requests.post(API.format(token=cfg.bot_token, method="getUpdates"),
+                              json=dict(poll, offset=offset), timeout=60)
+            data = r.json()
+        except requests.RequestException as e:
+            log.warning("getUpdates: сеть недоступна (%s)", security.mask(str(e)))
+            pause = min(pause * 2 or 5, 60)
+            continue
+
+        if not data.get("ok"):
+            err = data.get("error_code")
+            if err == 409:
+                # Другой процесс держит long-poll (например, облачное окно).
+                # Ждём и пробуем снова — владелец не должен видеть поток ошибок.
+                pause = min(pause * 2 or 10, 60)
+                log.warning("getUpdates 409: апдейты забирает другой экземпляр — "
+                            "повтор через %.0f с", pause)
+            else:
+                log.error("getUpdates failed: %s", security.mask(data))
+                pause = min(pause * 2 or 3, 60)
+            continue
+
+        pause = 0.0
+        updates = data.get("result") or []
+        if not updates:
+            continue
+        for u in updates:
+            offset = u["update_id"] + 1
+            try:
                 process_update(u)
-            st.kv_set("tg_offset", str(offset))
-        except Exception:  # noqa
-            log.exception("Ошибка в обработчике команд")
-            time.sleep(5)
+            except Exception:  # noqa
+                log.exception("Ошибка обработки апдейта %s", u.get("update_id"))
+        st.kv_set("tg_offset", str(offset))
 
 
 ADMIN_COMMANDS = ("/status", "/sync", "/post", "/emoji", "/emojis", "/setemoji",
                   "/resetemojis", "/check", "/start", "/help")
 
 HELP_TEXT = (
-    "<b>Команды</b>\n"
+    "<b>Быстрые кнопки</b> — под полем ввода 👇\n"
+    "🎯 1 игра · 📦 4 игры · 📰 новость · 🎮 по ссылке/ID\n"
+    "✍️ свой пост · 📊 статус · 🎨 эмодзи · 🔄 sync\n"
+    "\n<b>Команды</b>\n"
     "/status — статистика и расписание\n"
     "/check — самодиагностика автономности\n"
     "/sync — обновить каталог скидок\n"
     "/post single — пост об одной игре с описанием\n"
     "/post multi — подборка из 4 игр\n"
     "/post news — игровая новость дня\n"
+    "\n<b>Ручные посты</b>\n"
+    "Пришлите ссылку <code>store.steampowered.com/app/1091500</code>\n"
+    "или AppID <code>1091500</code> — покажу превью с кнопкой «Опубликовать».\n"
+    "Пришлите фото — соберу свой пост с подписью канала.\n"
     "\n<b>Эмодзи постов</b>\n"
     "/emojis — какие эмодзи стоят в каждом слоте\n"
     "/setemoji fire 🔥 — запомнить эмодзи для слота (можно premium)\n"
@@ -537,30 +841,120 @@ def main():
     _start_daemon()
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                                 capture_output=True, text=True, timeout=20).stdout
+            return str(pid) in out
+        os.kill(pid, 0)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _kill_pid(pid: int) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                           capture_output=True, text=True, timeout=20)
+        else:
+            os.kill(pid, 15)
+    except (OSError, subprocess.SubprocessError):
+        log.warning("Не удалось остановить процесс %s", pid)
+
+
+def _acquire_lock() -> None:
+    """Гарантирует единственный экземпляр бота (только один getUpdates)."""
+    cfg.ensure_dirs()
+    path = os.path.join(cfg.data_dir, "bot.lock")
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                old = int((f.read() or "0").strip())
+        except (OSError, ValueError):
+            old = 0
+        if old and old != os.getpid() and _pid_alive(old):
+            log.warning("Найден живой старый экземпляр (PID %s) — останавливаю", old)
+            _kill_pid(old)
+            time.sleep(2)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+    log.info("PID %s записан в %s", os.getpid(), path)
+
+
+def _setup_file_log() -> None:
+    cfg.ensure_dirs()
+    root = logging.getLogger()
+    for h in root.handlers:
+        if isinstance(h, RotatingFileHandler):
+            return
+    h = RotatingFileHandler(os.path.join(cfg.logs_dir, "bot.log"),
+                            maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    h.addFilter(security.TokenMaskFilter())  # токен не должен попасть в файл
+    root.addHandler(h)
+
+
 def _start_daemon(secs: int | None = None):
     cfg.ensure_dirs()
+    _setup_file_log()
     if not cfg.bot_token:
         log.error("Нет BOT_TOKEN в .env — скопируй .env.example в .env и заполни")
         raise SystemExit(2)
 
+    # единственный экземпляр: если старая копия висит — гасим, иначе Telegram
+    # будет отдавать апдейты то одному, то другому процессу (409 Conflict)
+    _acquire_lock()
+
     # НИКАКОГО блокирующего sync() перед потоками! Сначала сброс вебхука
-    # (чтобы getUpdates не ловил 409), затем сразу оба потока — команды
-    # владельца отвечают мгновенно. Первичный sync делает scheduler_loop
-    # в фоне через sync_if_needed().
+    # (чтобы getUpdates не ловил 409), затем сразу потоки — команды владельца
+    # отвечают мгновенно. Первичный sync делает scheduler_loop в фоне.
     _drop_webhook()
-    t1 = threading.Thread(target=scheduler_loop, daemon=True)
-    t2 = threading.Thread(target=command_handler, daemon=True)
-    t1.start()
-    t2.start()
+    if cfg.post_schedule:
+        threading.Thread(target=scheduler_loop, daemon=True).start()
+    else:
+        log.info("POST_SCHEDULE=0 — публикую только вручную, расписание в облаке")
+    threading.Thread(target=command_handler, daemon=True).start()
+
     log.info("Бот запущен%s. Канал: %s | расписание: %s",
              f" на {secs} с" if secs else " 24/7", cfg.channel,
-             ", ".join(f"{s['time'][0]:02d}:{s['time'][1]:02d} {s['kind']}" for s in cfg.schedule))
+             ", ".join(f"{s['time'][0]:02d}:{s['time'][1]:02d} {s['kind']}"
+                       for s in cfg.schedule))
+
+    # Владельцу — весточка, что бот снова на связи (режим 24/7, только раз)
+    if not secs and cfg.owner_id:
+        _notify_owner()
     if secs:
         time.sleep(secs)
         log.info("Окно работы закончилось — выходим, следующее запустит workflow")
         raise SystemExit(0)
-    while True:
-        time.sleep(60)
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        log.info("Остановлен вручную (Ctrl+C)")
+
+
+def _notify_owner() -> None:
+    """Сообщает владельцу в личку, что бот запущен и слушает команды."""
+    try:
+        r = _tg("sendMessage", json={
+            "chat_id": cfg.owner_id,
+            "text": ("✅ <b>Бот онлайн.</b>\n"
+                     f"Канал: {cfg.channel}\n"
+                     "Кнопки — под полем ввода. Пишите /start для справки."),
+            "parse_mode": "HTML",
+            "reply_markup": json.dumps(_menu(), ensure_ascii=False),
+        })
+        if r:
+            log.info("Владельцу отправлено уведомление «бот онлайн»")
+        else:
+            log.warning("Не удалось уведомить владельца (OWNER_ID=%s)", cfg.owner_id)
+    except Exception:  # noqa
+        log.exception("Ошибка уведомления владельца")
 
 
 if __name__ == "__main__":
